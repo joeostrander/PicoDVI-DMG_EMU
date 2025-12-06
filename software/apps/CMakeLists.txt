@@ -1,1 +1,1 @@
-add_subdirectory(dmg)
+add_subdirectory(dmg_emu)
