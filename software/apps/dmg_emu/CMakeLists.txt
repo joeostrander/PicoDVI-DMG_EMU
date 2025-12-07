@@ -4,6 +4,7 @@
 
 add_executable(dmg_emu
     main.c
+    hw_config.c
     shared_dma_handler.c
     colors.c
     audio/minigb_apu.c
@@ -28,6 +29,7 @@ target_compile_definitions(dmg_emu PRIVATE
     DVI_VERTICAL_REPEAT=${DVI_VERTICAL_REPEAT_VALUE}
     DVI_SYMBOLS_PER_WORD=2
     RESOLUTION_800x600=${RESOLUTION_800x600}
+    PICO_USE_MALLOC_PANIC=0
 )
 
 target_link_libraries(dmg_emu
@@ -40,11 +42,24 @@ target_link_libraries(dmg_emu
     hardware_i2c
     hardware_irq
     hardware_dma
+    FatFs_SPI
 )
 
-# Enable USB serial output for printf debugging
-pico_enable_stdio_usb(dmg_emu 1)
-pico_enable_stdio_uart(dmg_emu 0)
+# # Enable USB serial output for printf debugging
+# pico_enable_stdio_usb(dmg_emu 1)
+# pico_enable_stdio_uart(dmg_emu 0)
+
+# Enable UART stdio and disable USB stdio
+pico_enable_stdio_uart(dmg_emu 1)
+pico_enable_stdio_usb(dmg_emu 0)
+# Force printf to use UART0 instead of USB
+# I'm setting these in main instead, before pico/stdlib.h is included
+# set(PICO_DEFAULT_UART 0)       # Use UART0
+# set(PICO_DEFAULT_UART_TX_PIN 0) # GPIO0 for TX
+# set(PICO_DEFAULT_UART_RX_PIN 1) # GPIO1 for RX
+# set(PICO_STDIO_DEFAULT_CRLF 1)  # Optional: convert \n to \r\n
+
+target_include_directories(dmg_emu PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 # Build pio programs
 # pico_generate_pio_header(dmg_emu ${CMAKE_CURRENT_LIST_DIR}/video_capture.pio)

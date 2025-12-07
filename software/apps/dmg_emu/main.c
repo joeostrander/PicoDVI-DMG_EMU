@@ -14,6 +14,13 @@ TODO:
 // PicoDVI-DMG_EMU
 //
 
+// Keep these defines at the top before including pico headers
+#define PICO_DEFAULT_UART_BAUD_RATE 115200
+#define PICO_DEFAULT_UART_TX_PIN    0
+#define PICO_DEFAULT_UART_RX_PIN    1
+#define PICO_DEFAULT_UART 0
+// #define PICO_STDIO_DEFAULT_CRLF 1
+
 // REMINDER: Always use cmake with:  -DPICO_COPY_TO_RAM=1
 
 // #pragma GCC optimize("Os")
@@ -25,12 +32,17 @@ TODO:
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <unistd.h>
 #include "hardware/vreg.h"
 #include "hardware/i2c.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
+#include "pico/stdio.h"
+#include "pico/platform.h"
 
 #include "dvi.h"
 #include "dvi_serialiser.h"
@@ -42,6 +54,12 @@ TODO:
 
 #include "colors.h"
 #include "hedley.h"
+#include "board_pins.h"
+#include "ff.h"
+#include "f_util.h"
+#include "hw_config.h"
+#include "sd_card.h"
+#include "diskio.h"
 
 #define SAMPLE_FREQ                 32768
 #define AUDIO_BUFFER_SIZE           2048
@@ -63,9 +81,13 @@ TODO:
 
 
 #define ENABLE_AUDIO                1  // Enable Peanut-GB audio path
-#define ENABLE_PIO_DMG_BUTTONS      0
-#define ENABLE_CPU_DMG_BUTTONS      0
 #define ENABLE_OSD                  0  // Set to 1 to enable OSD code, 0 to disable (TODO)
+
+#define MAX_SD_ROM_FILE_BYTES       (ROM_BANK_SIZE * 512u)
+#define MAX_SD_ROM_HEAP_BYTES       (192u * 1024u)
+#define SD_HEAP_SAFETY_MARGIN_BYTES (32u * 1024u)
+#define SD_ROM_CACHE_SLOTS          2u
+#define SD_STREAM_CHUNK_BYTES       256u
 
 
 #if ENABLE_AUDIO
@@ -82,26 +104,6 @@ static void write_samples_to_ring(const audio_sample_t *samples, size_t sample_c
 #define DEBUG_BUTTON_PRESS   // Illuminate LED on button presses
 
 #define ONBOARD_LED_PIN             25
-
-// GAMEBOY VIDEO INPUT (From level shifter)
-
-#define HSYNC_PIN                   0
-#define DATA_1_PIN                  1
-#define DATA_0_PIN                  2
-#define PIXEL_CLOCK_PIN             3
-#define VSYNC_PIN                   4
-#define DMG_READING_BUTTONS_PIN     5       // P15
-#define DMG_READING_DPAD_PIN        6       // P14
-#define DMG_OUTPUT_RIGHT_A_PIN      7       // P10
-#define DMG_OUTPUT_UP_SELECT_PIN    8       // P12
-#define DMG_OUTPUT_DOWN_START_PIN   9       // P13
-#define DMG_OUTPUT_LEFT_B_PIN       10      // P11
-
-// the bit order coincides with the pin order
-#define BIT_RIGHT_A                 (1<<0)  // P10
-#define BIT_UP_SELECT               (1<<1)  // P12
-#define BIT_DOWN_START              (1<<2)  // P13
-#define BIT_LEFT_B                  (1<<3)  // P11
 
 // I2C Pins, etc. -- for I2C controller
 #define SDA_PIN                     26
@@ -129,9 +131,50 @@ static uint8_t packed_buffer_1[PACKED_FRAME_SIZE] = {0};
 static volatile uint8_t* packed_display_ptr = packed_buffer_0;
 static uint8_t* packed_render_ptr = packed_buffer_1;
 
+typedef enum
+{
+    ROM_SOURCE_BUILTIN = 0,
+    ROM_SOURCE_SD_STREAM,
+    ROM_SOURCE_SD_HEAP
+} rom_source_t;
+
+typedef struct
+{
+    uint32_t bank_index;
+    size_t bytes_valid;
+    bool valid;
+    uint8_t data[ROM_BANK_SIZE];
+} sd_rom_cache_slot_t;
+
+typedef struct
+{
+    FIL handle;
+    bool open;
+    size_t size_bytes;
+    uint32_t bank_count;
+    uint32_t next_replace_slot;
+} sd_rom_stream_state_t;
+
+static sd_rom_cache_slot_t sd_rom_cache[SD_ROM_CACHE_SLOTS];
+
 static struct gb_s gb;
 static uint8_t rom_bank0[0x4000];
 static uint8_t cart_ram[0x8000];
+static sd_card_t *mounted_sd_card = NULL;
+static bool sd_filesystem_ready = false;
+static bool sd_rom_discovered = false;
+static char sd_rom_path[256] = {0};
+static const uint8_t *active_rom_data = ACTIVE_ROM_DATA;
+static size_t active_rom_length = ACTIVE_ROM_LEN;
+static rom_source_t active_rom_source = ROM_SOURCE_BUILTIN;
+static uint8_t *sd_rom_heap = NULL;
+static size_t sd_rom_heap_size = 0;
+static sd_rom_stream_state_t sd_rom_stream = {
+    .open = false,
+    .size_bytes = 0,
+    .bank_count = 0,
+    .next_replace_slot = 0
+};
 
 static void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line);
 static uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr);
@@ -141,6 +184,18 @@ static void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16
 static void update_emulator_inputs(void);
 static void swap_display_buffers(void);
 static void handle_palette_hotkeys(void);
+static bool mount_sd_card(void);
+static bool discover_sd_rom(void);
+static bool load_sd_rom_file(const char *path);
+static void reset_active_rom_to_builtin(void);
+static void boot_checkpoint(const char *label);
+static void invalidate_sd_rom_cache(void);
+static void close_sd_rom_stream(void);
+static void free_sd_rom_heap(void);
+static size_t estimate_free_heap_bytes(void);
+static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot);
+static uint8_t sd_stream_read_byte(size_t addr);
+static void sd_stream_chunk_yield(void);
 
 
 typedef enum
@@ -162,12 +217,6 @@ typedef enum
     BUTTON_STATE_PRESSED = 0,
     BUTTON_STATE_UNPRESSED
 } button_state_t;
-
-#if ENABLE_PIO_DMG_BUTTONS
-static PIO pio_dmg_emu_buttons = pio0;
-// TODO static uint dmg_emu_buttons_sm = 3;  // Use SM3 (SM0, SM1, SM2 used by DVI TMDS channels)
-static uint pio_buttons_out_value = 0;
-#endif
 
 static uint8_t button_states[BUTTON_COUNT];
 
@@ -257,14 +306,586 @@ uint8_t line_buffer[DMG_PIXELS_X / 4] = {0};  // 40 bytes for 160 pixels packed
 #endif // RESOLUTION
 
 
-static void initialize_gpio(void);
-#if ENABLE_PIO_DMG_BUTTONS
-static void initialize_dmg_emu_buttons_pio_program(void);
-#endif
+static bool mount_sd_card(void)
+{
+    printf("[SD] mount_sd_card entry\n");
 
-#if ENABLE_CPU_DMG_BUTTONS
-static void __no_inline_not_in_flash_func(gpio_callback)(uint gpio, uint32_t events);
+    if (sd_filesystem_ready && mounted_sd_card != NULL && mounted_sd_card->mounted) {
+        printf("SD mount skipped: already mounted.\n");
+        return true;
+    }
+
+    sd_card_t *card = sd_get_by_num(0);
+    if (card == NULL) {
+        printf("SD mount skipped: no slot configured\n");
+        return false;
+    }
+
+    printf("Initializing SD card interface...\n");
+    set_spi_dma_irq_channel(true, true);
+
+    int status = sd_init(card);
+    if (status & STA_NODISK) {
+        printf("SD mount failed: no card detected (status=0x%02x)\n", status);
+        return false;
+    }
+
+    if (status & STA_NOINIT) {
+        printf("SD mount failed: card did not initialize (status=0x%02x)\n", status);
+        return false;
+    }
+
+    printf("Mounting FatFs volume on %s\n", card->pcName != NULL ? card->pcName : "<null>");
+
+    FRESULT mount_result = f_mount(&card->fatfs, card->pcName, 1);
+    if (mount_result != FR_OK) {
+        printf("f_mount failed (%d: %s)\n", mount_result, FRESULT_str(mount_result));
+        card->mounted = false;
+        mounted_sd_card = NULL;
+        sd_filesystem_ready = false;
+        return false;
+    }
+
+    if (card->pcName != NULL) {
+        FRESULT chdrive_result = f_chdrive(card->pcName);
+        if (chdrive_result != FR_OK) {
+            printf("f_chdrive failed (%d: %s) for %s\n",
+                   chdrive_result,
+                   FRESULT_str(chdrive_result),
+                   card->pcName);
+            f_mount(NULL, card->pcName, 0);
+            card->mounted = false;
+            mounted_sd_card = NULL;
+            sd_filesystem_ready = false;
+            return false;
+        }
+    }
+
+    FRESULT chdir_result = f_chdir("/");
+    if (chdir_result != FR_OK) {
+        printf("f_chdir('/') failed (%d: %s)\n", chdir_result, FRESULT_str(chdir_result));
+        if (card->pcName != NULL) {
+            f_mount(NULL, card->pcName, 0);
+        }
+        card->mounted = false;
+        mounted_sd_card = NULL;
+        sd_filesystem_ready = false;
+        return false;
+    }
+
+    card->mounted = true;
+    mounted_sd_card = card;
+    sd_filesystem_ready = true;
+    sd_rom_discovered = false;
+    sd_rom_path[0] = '\0';
+
+    printf("SD filesystem ready.\n");
+    return true;
+}
+
+static bool filename_is_rom(const char *filename)
+{
+    if (filename == NULL) {
+        return false;
+    }
+
+    const char *dot = strrchr(filename, '.');
+    if ((dot == NULL) || (dot[1] == '\0')) {
+        return false;
+    }
+
+    const char *ext = dot + 1;
+    const char first = (char)tolower((unsigned char)ext[0]);
+    const char second = (char)tolower((unsigned char)ext[1]);
+
+    if ((first != 'g') || (second != 'b')) {
+        return false;
+    }
+
+    if (ext[2] == '\0') {
+        return true;  // .gb
+    }
+
+    const char third = (char)tolower((unsigned char)ext[2]);
+    return (third == 'c') && (ext[3] == '\0');  // .gbc
+}
+
+static bool find_first_rom_in_directory(const char *directory, char *out_path, size_t out_len)
+{
+    if ((directory == NULL) || (out_path == NULL) || (out_len == 0)) {
+        return false;
+    }
+
+    size_t dir_len = strlen(directory);
+    bool directory_has_sep = (dir_len > 0) && (directory[dir_len - 1] == '/' || directory[dir_len - 1] == '\\');
+
+    DIR dir;
+    FILINFO info;
+    memset(&info, 0, sizeof(info));
+    FRESULT fr = f_opendir(&dir, directory);
+    if (fr != FR_OK) {
+        return false;
+    }
+
+    bool found = false;
+    while (true) {
+        fr = f_readdir(&dir, &info);
+        if ((fr != FR_OK) || (info.fname[0] == '\0')) {
+            break;
+        }
+
+        if (info.fattrib & AM_DIR) {
+            continue;
+        }
+
+        const char *name = (const char *)info.fname;
+#if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
+        if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
+            name = (const char *)info.altname;
+        }
 #endif
+        if ((name == NULL) || !filename_is_rom(name)) {
+            continue;
+        }
+
+        const char *fmt = directory_has_sep ? "%s%s" : "%s/%s";
+        int needed = snprintf(out_path, out_len, fmt, directory, name);
+        if ((needed > 0) && ((size_t)needed < out_len)) {
+            found = true;
+        }
+        break;
+    }
+
+    FRESULT close_result = f_closedir(&dir);
+    if ((close_result != FR_OK) && !found) {
+        printf("f_closedir failed (%d: %s) while scanning %s\n", close_result, FRESULT_str(close_result), directory);
+    }
+    return found;
+}
+
+static void log_roms_in_directory(const char *directory)
+{
+    if ((directory == NULL) || !sd_filesystem_ready) {
+        return;
+    }
+
+    DIR dir;
+    FILINFO info;
+    memset(&info, 0, sizeof(info));
+    FRESULT fr = f_opendir(&dir, directory);
+    if (fr != FR_OK) {
+        printf("ROM scan: unable to open %s (%d: %s)\n", directory, fr, FRESULT_str(fr));
+        return;
+    }
+
+    printf("ROM scan: %s\n", directory);
+    bool any = false;
+
+    while (true) {
+        fr = f_readdir(&dir, &info);
+        if (fr != FR_OK) {
+            printf("  readdir failed (%d: %s)\n", fr, FRESULT_str(fr));
+            break;
+        }
+        if (info.fname[0] == '\0') {
+            break;
+        }
+        if (info.fattrib & AM_DIR) {
+            continue;
+        }
+
+        const char *name = (const char *)info.fname;
+#if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
+        if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
+            name = (const char *)info.altname;
+        }
+#endif
+        if ((name == NULL) || !filename_is_rom(name)) {
+            continue;
+        }
+
+        any = true;
+        printf("  %s\n", name);
+    }
+
+    if (!any) {
+        printf("  <no ROMs>\n");
+    }
+
+    FRESULT close_result = f_closedir(&dir);
+    if (close_result != FR_OK) {
+        printf("  close failed (%d: %s)\n", close_result, FRESULT_str(close_result));
+    }
+}
+
+static void dump_sd_rom_inventory(void)
+{
+    if (!sd_filesystem_ready) {
+        printf("ROM scan skipped: filesystem not ready\n");
+        return;
+    }
+
+    const char *search_paths[] = {
+        "0:/ROMS",
+        "0:/"
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+        log_roms_in_directory(search_paths[i]);
+    }
+}
+
+static void boot_checkpoint(const char *label)
+{
+    if (label == NULL) {
+        return;
+    }
+
+    printf("[BOOT] %s\n", label);
+}
+
+static void invalidate_sd_rom_cache(void)
+{
+    for (uint32_t i = 0; i < SD_ROM_CACHE_SLOTS; ++i) {
+        sd_rom_cache[i].valid = false;
+        sd_rom_cache[i].bank_index = 0;
+        sd_rom_cache[i].bytes_valid = 0;
+    }
+    sd_rom_stream.next_replace_slot = 0;
+}
+
+static void close_sd_rom_stream(void)
+{
+    if (sd_rom_stream.open) {
+        f_close(&sd_rom_stream.handle);
+        sd_rom_stream.open = false;
+    }
+
+    sd_rom_stream.size_bytes = 0;
+    sd_rom_stream.bank_count = 0;
+    invalidate_sd_rom_cache();
+}
+
+static void free_sd_rom_heap(void)
+{
+    if (sd_rom_heap != NULL) {
+        free(sd_rom_heap);
+        sd_rom_heap = NULL;
+        sd_rom_heap_size = 0;
+    }
+}
+
+static size_t estimate_free_heap_bytes(void)
+{
+    extern char __StackLimit;
+    void *current_break = sbrk(0);
+    if (current_break == (void *)-1 || current_break == NULL) {
+        return 0;
+    }
+
+    uintptr_t stack_limit = (uintptr_t)&__StackLimit;
+    uintptr_t heap_end = (uintptr_t)current_break;
+    if (heap_end >= stack_limit) {
+        return 0;
+    }
+
+    return (size_t)(stack_limit - heap_end);
+}
+
+static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot)
+{
+    if (!sd_rom_stream.open) {
+        return false;
+    }
+
+    if (bank_index >= sd_rom_stream.bank_count) {
+        return false;
+    }
+
+    size_t offset = (size_t)bank_index * ROM_BANK_SIZE;
+    FRESULT fr = f_lseek(&sd_rom_stream.handle, (FSIZE_t)offset);
+    if (fr != FR_OK) {
+        printf("SD ROM cache seek failed (bank=%lu): %s (%d)\n",
+               (unsigned long)bank_index, FRESULT_str(fr), fr);
+        close_sd_rom_stream();
+        return false;
+    }
+
+    size_t bytes_to_read = sd_rom_stream.size_bytes - offset;
+    if (bytes_to_read > ROM_BANK_SIZE) {
+        bytes_to_read = ROM_BANK_SIZE;
+    }
+
+    uint8_t *dst = slot->data;
+    size_t remaining = bytes_to_read;
+    while (remaining > 0) {
+        size_t chunk = (remaining > SD_STREAM_CHUNK_BYTES) ? SD_STREAM_CHUNK_BYTES : remaining;
+        UINT chunk_read = 0;
+        fr = f_read(&sd_rom_stream.handle, dst, (UINT)chunk, &chunk_read);
+        if ((fr != FR_OK) || (chunk_read != chunk)) {
+            printf("SD ROM cache read failed (bank=%lu chunk=%u): %s (%d)\n",
+                   (unsigned long)bank_index, (unsigned int)chunk, FRESULT_str(fr), fr);
+            close_sd_rom_stream();
+            return false;
+        }
+
+        dst += chunk_read;
+        remaining -= chunk_read;
+
+        if (remaining > 0) {
+            sd_stream_chunk_yield();
+        }
+    }
+
+    if (bytes_to_read < ROM_BANK_SIZE) {
+        memset(slot->data + bytes_to_read, 0xFF, ROM_BANK_SIZE - bytes_to_read);
+    }
+
+    slot->bank_index = bank_index;
+    slot->bytes_valid = bytes_to_read;
+    slot->valid = true;
+    return true;
+}
+
+static uint8_t sd_stream_read_byte(size_t addr)
+{
+    if (!sd_rom_stream.open) {
+        return 0xFF;
+    }
+
+    if (addr >= sd_rom_stream.size_bytes) {
+        return 0xFF;
+    }
+
+    uint32_t bank_index = (uint32_t)(addr / ROM_BANK_SIZE);
+    uint32_t bank_offset = (uint32_t)(addr % ROM_BANK_SIZE);
+
+    for (uint32_t i = 0; i < SD_ROM_CACHE_SLOTS; ++i) {
+        sd_rom_cache_slot_t *slot = &sd_rom_cache[i];
+        if (slot->valid && slot->bank_index == bank_index) {
+            if (bank_offset >= slot->bytes_valid) {
+                return 0xFF;
+            }
+            return slot->data[bank_offset];
+        }
+    }
+
+    sd_rom_cache_slot_t *slot = &sd_rom_cache[sd_rom_stream.next_replace_slot];
+    if (!sd_stream_load_bank(bank_index, slot)) {
+        return 0xFF;
+    }
+    sd_rom_stream.next_replace_slot = (sd_rom_stream.next_replace_slot + 1u) % SD_ROM_CACHE_SLOTS;
+
+    if (bank_offset >= slot->bytes_valid) {
+        return 0xFF;
+    }
+    return slot->data[bank_offset];
+}
+
+static bool discover_sd_rom(void)
+{
+    if (!sd_filesystem_ready) {
+        return false;
+    }
+
+    dump_sd_rom_inventory();
+
+    const char *search_paths[] = {
+        "0:/ROMS",
+        "0:/"
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+        if (find_first_rom_in_directory(search_paths[i], sd_rom_path, sizeof(sd_rom_path))) {
+            printf("Found SD ROM: %s\n", sd_rom_path);
+            sd_rom_discovered = true;
+            boot_checkpoint("discover_sd_rom about to return true");
+            return true;
+        }
+    }
+
+    printf("No .gb/.gbc files found on SD card (checked /ROMS and root).\n");
+    sd_rom_discovered = false;
+    sd_rom_path[0] = '\0';
+    return false;
+}
+
+static void reset_active_rom_to_builtin(void)
+{
+    close_sd_rom_stream();
+    active_rom_data = ACTIVE_ROM_DATA;
+    active_rom_length = ACTIVE_ROM_LEN;
+    active_rom_source = ROM_SOURCE_BUILTIN;
+    close_sd_rom_stream();
+    free_sd_rom_heap();
+}
+
+static bool load_sd_rom_file(const char *path)
+{
+    boot_checkpoint("load_sd_rom_file entry");
+    if (!sd_filesystem_ready || path == NULL || path[0] == '\0') {
+        printf("SD ROM load skipped: filesystem not ready or path missing\n");
+        return false;
+    }
+
+    close_sd_rom_stream();
+    free_sd_rom_heap();
+
+    printf("SD ROM load: opening %s\n", path);
+
+    FIL temp_file;
+    FRESULT fr = f_open(&temp_file, path, FA_READ);
+    if (fr != FR_OK) {
+        printf("SD ROM load failed to open %s (%d: %s)\n", path, fr, FRESULT_str(fr));
+        return false;
+    }
+    boot_checkpoint("SD ROM file opened");
+
+    printf("[TRACE] FIL starting cluster=%lu, objsize=%llu\n",
+           (unsigned long)temp_file.obj.sclust,
+           (unsigned long long)temp_file.obj.objsize);
+    FSIZE_t file_size = f_size(&temp_file);
+    printf("[TRACE] f_size returned %lu\n", (unsigned long)file_size);
+    f_close(&temp_file);
+
+    fr = f_open(&sd_rom_stream.handle, path, FA_READ);
+    if (fr != FR_OK) {
+        printf("SD ROM load failed to reopen %s (%d: %s)\n", path, fr, FRESULT_str(fr));
+        return false;
+    }
+
+    sd_rom_stream.open = true;
+    sd_rom_stream.size_bytes = (size_t)file_size;
+    boot_checkpoint("SD ROM file size read");
+
+    if ((sd_rom_stream.size_bytes == 0) || (sd_rom_stream.size_bytes > MAX_SD_ROM_FILE_BYTES)) {
+        printf("SD ROM load aborted: size %lu bytes (limit %u)\n",
+               (unsigned long)sd_rom_stream.size_bytes,
+               (unsigned int)MAX_SD_ROM_FILE_BYTES);
+        close_sd_rom_stream();
+        return false;
+    }
+
+    size_t rom_size_bytes = sd_rom_stream.size_bytes;
+    size_t approx_free_heap = estimate_free_heap_bytes();
+    bool rom_within_heap_limit = (rom_size_bytes <= MAX_SD_ROM_HEAP_BYTES);
+    size_t required_with_margin = rom_size_bytes + SD_HEAP_SAFETY_MARGIN_BYTES;
+    bool heap_headroom_ok = approx_free_heap > required_with_margin;
+
+    if (!rom_within_heap_limit) {
+        printf("SD ROM heap load skipped: %lu bytes exceeds limit (%u)\n",
+               (unsigned long)rom_size_bytes, (unsigned int)MAX_SD_ROM_HEAP_BYTES);
+    }
+
+    if (rom_within_heap_limit && heap_headroom_ok) {
+        boot_checkpoint("Attempting heap load");
+        uint8_t *heap_buffer = (uint8_t *)malloc(rom_size_bytes);
+        if (heap_buffer != NULL) {
+            boot_checkpoint("Heap buffer allocated");
+            size_t total_read = 0;
+            while (total_read < rom_size_bytes) {
+                UINT chunk_read = 0;
+                size_t remaining = rom_size_bytes - total_read;
+                size_t to_request = (remaining > 4096) ? 4096 : remaining;
+                FRESULT heap_read = f_read(&sd_rom_stream.handle,
+                                           heap_buffer + total_read,
+                                           (UINT)to_request,
+                                           &chunk_read);
+                if ((heap_read != FR_OK) || (chunk_read == 0)) {
+                    printf("SD ROM heap read error (%d: %s) after %u bytes\n",
+                           heap_read, FRESULT_str(heap_read), (unsigned int)total_read);
+                    free(heap_buffer);
+                    heap_buffer = NULL;
+                    break;
+                }
+                total_read += chunk_read;
+            }
+
+            if (heap_buffer != NULL && total_read == rom_size_bytes) {
+                boot_checkpoint("SD ROM heap copy complete");
+                sd_rom_heap = heap_buffer;
+                sd_rom_heap_size = rom_size_bytes;
+                size_t copy_len = (rom_size_bytes < sizeof(rom_bank0)) ? rom_size_bytes : sizeof(rom_bank0);
+                memcpy(rom_bank0, sd_rom_heap, copy_len);
+                if (copy_len < sizeof(rom_bank0)) {
+                    memset(rom_bank0 + copy_len, 0xFF, sizeof(rom_bank0) - copy_len);
+                }
+                close_sd_rom_stream();
+                active_rom_source = ROM_SOURCE_SD_HEAP;
+                active_rom_data = sd_rom_heap;
+                active_rom_length = rom_size_bytes;
+                printf("Loaded SD ROM into heap (%lu bytes)\n", (unsigned long)rom_size_bytes);
+                return true;
+            }
+        } else {
+            printf("SD ROM heap alloc failed for %lu bytes - falling back to streaming\n",
+                   (unsigned long)rom_size_bytes);
+        }
+
+        if (sd_rom_heap == NULL) {
+            boot_checkpoint("Heap path failed; rewinding file");
+            free_sd_rom_heap();
+            FRESULT rewind_res = f_lseek(&sd_rom_stream.handle, 0);
+            if (rewind_res != FR_OK) {
+                printf("SD ROM load failed while rewinding after heap attempt (%d: %s)\n",
+                       rewind_res, FRESULT_str(rewind_res));
+                close_sd_rom_stream();
+                return false;
+            }
+        }
+    } else if (rom_within_heap_limit) {
+        printf("SD ROM heap load skipped: need ~%lu bytes (incl. margin), free ~%lu\n",
+               (unsigned long)required_with_margin,
+               (unsigned long)approx_free_heap);
+    }
+
+    sd_rom_stream.bank_count = (uint32_t)((sd_rom_stream.size_bytes + ROM_BANK_SIZE - 1u) / ROM_BANK_SIZE);
+    if (sd_rom_stream.bank_count == 0) {
+        printf("SD ROM load aborted: unable to determine bank count\n");
+        close_sd_rom_stream();
+        return false;
+    }
+    boot_checkpoint("SD ROM stream initialized");
+
+    invalidate_sd_rom_cache();
+    FRESULT seek_res = f_lseek(&sd_rom_stream.handle, 0);
+    if (seek_res != FR_OK) {
+        printf("SD ROM load failed while seeking to start (%d: %s)\n", seek_res, FRESULT_str(seek_res));
+        close_sd_rom_stream();
+        return false;
+    }
+
+    size_t rom0_bytes = (sd_rom_stream.size_bytes < sizeof(rom_bank0)) ? sd_rom_stream.size_bytes : sizeof(rom_bank0);
+    UINT bytes_read = 0;
+    FRESULT read_res = f_read(&sd_rom_stream.handle, rom_bank0, (UINT)rom0_bytes, &bytes_read);
+    if ((read_res != FR_OK) || (bytes_read != rom0_bytes)) {
+        printf("SD ROM load failed while reading bank 0 (%d: %s)\n", read_res, FRESULT_str(read_res));
+        close_sd_rom_stream();
+        return false;
+    }
+
+    printf("SD ROM load: copied %u bytes into bank 0\n", (unsigned int)bytes_read);
+
+    if (rom0_bytes < sizeof(rom_bank0)) {
+        memset(rom_bank0 + rom0_bytes, 0xFF, sizeof(rom_bank0) - rom0_bytes);
+    }
+
+    active_rom_source = ROM_SOURCE_SD_STREAM;
+    active_rom_data = NULL;
+    active_rom_length = sd_rom_stream.size_bytes;
+
+    // printf("Streaming SD ROM (%lu bytes) from %s\n", (unsigned long)sd_rom_stream.size_bytes, path);
+
+    // uint8_t probe = sd_stream_read_byte(0x4000);
+    // printf("[SD] Bank1 probe = 0x%02x\n", probe);
+    /* temporarily disable USB flush here */
+
+    boot_checkpoint("load_sd_rom_file about to return true");
+    return true;
+}
+
+
+static void initialize_gpio(void);
 
 static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
 static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
@@ -315,8 +936,6 @@ static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline
         const uint8_t* packed_fb = (const uint8_t*)packed_display_ptr;
         if (packed_fb != NULL) {
             const uint8_t* packed_line = packed_fb + (dmg_line_idx * DMG_PIXELS_X / 4);  // 40 bytes per line            
-            // Simply copy the packed 2bpp data directly!
-            // No unpacking, no palette lookup - the TMDS encoder handles everything
             // Encoder will apply RGB888 palette and 4× horizontal scaling (160→640 pixels)
             // Plus 80 pixels of blank borders on each side for centering in 800 pixels
             memcpy(line_buffer, packed_line, sizeof(line_buffer));  // Copy 40 bytes
@@ -339,8 +958,11 @@ static uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr)
     if (addr < sizeof(rom_bank0)) {
         return rom_bank0[addr];
     }
-    if (addr < ACTIVE_ROM_LEN) {
-        return ACTIVE_ROM_DATA[addr];
+    if (active_rom_source == ROM_SOURCE_SD_STREAM) {
+        return sd_stream_read_byte((size_t)addr);
+    }
+    if ((active_rom_data != NULL) && (addr < active_rom_length)) {
+        return active_rom_data[addr];
     }
     return 0xFF;
 }
@@ -410,13 +1032,32 @@ static void swap_display_buffers(void)
 
 static bool init_peanut_emulator(void)
 {
-    printf("ROM[0..3] = %02x %02x %02x %02x (len=%u)\n",
-        ACTIVE_ROM_DATA[0], ACTIVE_ROM_DATA[1],
-        ACTIVE_ROM_DATA[2], ACTIVE_ROM_DATA[3],
-        ACTIVE_ROM_LEN);
+    if (active_rom_source == ROM_SOURCE_BUILTIN || active_rom_source == ROM_SOURCE_SD_HEAP) {
+        size_t rom0_bytes = (active_rom_length < sizeof(rom_bank0)) ? active_rom_length : sizeof(rom_bank0);
+        if ((active_rom_data != NULL) && (rom0_bytes > 0)) {
+            memcpy(rom_bank0, active_rom_data, rom0_bytes);
+        }
+        if (rom0_bytes < sizeof(rom_bank0)) {
+            memset(rom_bank0 + rom0_bytes, 0xFF, sizeof(rom_bank0) - rom0_bytes);
+        }
+    } else if (!sd_rom_stream.open) {
+        memset(rom_bank0, 0xFF, sizeof(rom_bank0));
+    }
 
-    size_t rom0_bytes = ACTIVE_ROM_LEN < sizeof(rom_bank0) ? ACTIVE_ROM_LEN : sizeof(rom_bank0);
-    memcpy(rom_bank0, ACTIVE_ROM_DATA, rom0_bytes);
+    const char *rom_source_label = "builtin";
+    if (active_rom_source == ROM_SOURCE_SD_STREAM) {
+        rom_source_label = "SD-stream";
+    } else if (active_rom_source == ROM_SOURCE_SD_HEAP) {
+        rom_source_label = "SD-heap";
+    }
+    printf("ROM[0..3] src=%s = %02x %02x %02x %02x (len=%u)\n",
+        rom_source_label,
+        rom_bank0[0],
+        rom_bank0[1],
+        rom_bank0[2],
+        rom_bank0[3],
+        (unsigned int)active_rom_length);
+
     memset(cart_ram, 0xFF, sizeof(cart_ram));
 
     enum gb_init_error_e ret = gb_init(&gb,
@@ -532,39 +1173,89 @@ static void pump_audio_samples(void)
 
 int main(void)
 {
-    for (int i = 0; i < BUTTON_COUNT; i++)
-    {
-        button_states[i] = BUTTON_STATE_UNPRESSED;
-    }
-
-    stdio_init_all();
-    sleep_ms(3000);  // Give USB more time to enumerate
-
-    for (int i = 0; i < 5; i++) {
-        printf("\n\n=== PicoDVI-DMG_EMU Starting (attempt %d) ===\n", i + 1);
-        stdio_flush();
-        sleep_ms(100);
-    }
-
     vreg_set_voltage(VREG_VSEL);
     sleep_ms(10);
     set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
 
-    memcpy(packed_buffer_0, mario_packed_160x144, PACKED_FRAME_SIZE);
-    memcpy(packed_buffer_1, packed_buffer_0, PACKED_FRAME_SIZE);
+    for (int i = 0; i < BUTTON_COUNT; i++)
+    {
+        button_states[i] = BUTTON_STATE_UNPRESSED;
+    }
+    
+    stdio_init_all();
+    // uart_init(uart0, 115200);
+    // gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
+    // gpio_set_function(PICO_DEFAULT_UART_RX_PIN, GPIO_FUNC_UART);
+    
+    // sleep_ms(3000);  // Give USB more time to enumerate
+
+
+
+    reset_active_rom_to_builtin();
+
+
+    for (int i = 0; i < 5; i++) {
+        printf("\n\n=== PicoDVI-DMG_EMU Starting (attempt %d) ===\n", i + 1);
+        sleep_ms(100);
+    }
+
+    printf("Firmware build: %s %s\n", __DATE__, __TIME__);
+
+    // boot_checkpoint("USB console ready");
+
+
+
+    boot_checkpoint("Clocks configured");
+
+    printf("[TRACE] entering display-prep stage\n");
+
+    boot_checkpoint("Preparing display buffers (pre-copy)");
+    // Temporary: clear buffers instead of copying mario_packed_160x144
+    memset(packed_buffer_0, 0xFF, PACKED_FRAME_SIZE);
+    boot_checkpoint("Display buffer 0 clear complete");
+    memset(packed_buffer_1, 0xFF, PACKED_FRAME_SIZE);
+    boot_checkpoint("Display buffer 1 clear complete");
     packed_display_ptr = packed_buffer_0;
     packed_render_ptr = packed_buffer_1;
+    boot_checkpoint("Display buffers primed");
+
+    boot_checkpoint("Calling mount_sd_card");
+    bool sd_mount_ok = mount_sd_card();
+    boot_checkpoint("mount_sd_card returned");
+
+    if (!sd_mount_ok) {
+        printf("Continuing with built-in ROM image (SD unavailable).\n");
+    } else {
+        if (discover_sd_rom()) {
+            boot_checkpoint("discover_sd_rom returned true");
+            printf("About to load SD ROM via load_sd_rom_file(): %s\n", sd_rom_path);
+            if (load_sd_rom_file(sd_rom_path)) {
+                boot_checkpoint("load_sd_rom_file returned true");
+                printf("load_sd_rom_file success for %s\n", sd_rom_path);
+                boot_checkpoint("SD ROM loaded into memory");
+            } else {
+                printf("SD ROM load failed - reverting to built-in image.\n");
+                reset_active_rom_to_builtin();
+            }
+        } else {
+            boot_checkpoint("discover_sd_rom returned false");
+            printf("No SD ROM discovered - using built-in image.\n");
+        }
+    }
+    boot_checkpoint("SD stage complete");
 
     dvi0.timing = &DVI_TIMING;
     dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
     dvi0.scanline_callback = core1_scanline_callback;
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
+    boot_checkpoint("DVI configured");
 
     set_game_palette(SCHEME_SGB_4H);
 
     uint32_t *bufptr = (uint32_t *)line_buffer;
     queue_add_blocking_u32(&dvi0.q_colour_valid, &bufptr);
     queue_add_blocking_u32(&dvi0.q_colour_valid, &bufptr);
+    boot_checkpoint("Scanline buffers primed");
 
 #if ENABLE_AUDIO
     int offset;
@@ -589,29 +1280,23 @@ int main(void)
     dvi_set_audio_freq(&dvi0, rate, cts, hdmi_n[offset]);
     increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE / 2);
     printf("Audio buffer pre-filled to %d samples (50%%)\n", AUDIO_BUFFER_SIZE / 2);
+    boot_checkpoint("Audio pipeline ready");
 #endif
 
-    printf("Starting Core 1 (DVI output)...\n");
+    boot_checkpoint("Starting Core 1 (DVI output)");
     multicore_launch_core1(core1_main);
-    printf("Core 1 running - now consuming video!\n");
+    boot_checkpoint("Core 1 running - now consuming video");
 
-    printf("Initializing GPIO...\n");
+    boot_checkpoint("Initializing GPIO");
     initialize_gpio();
-#if ENABLE_PIO_DMG_BUTTONS
-    printf("Initializing PIO programs for DMG controller...\n");
-    initialize_dmg_emu_buttons_pio_program();
-#endif
-
-#if ENABLE_CPU_DMG_BUTTONS
-    gpio_set_irq_enabled_with_callback(DMG_READING_DPAD_PIN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
-    gpio_set_irq_enabled(DMG_READING_BUTTONS_PIN, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
-#endif // ENABLE_CPU_DMG_BUTTONS
+    boot_checkpoint("GPIO initialized");
 
     if (!init_peanut_emulator()) {
         while (1) {
             tight_loop_contents();
         }
     }
+    boot_checkpoint("Peanut-GB initialized");
     printf("Peanut-GB initialized - entering main loop\n");
 
     absolute_time_t next_frame_time = make_timeout_time_us(DMG_FRAME_DURATION_US);
@@ -626,15 +1311,6 @@ int main(void)
     #endif
         swap_display_buffers();
         handle_palette_hotkeys();
-
-#if ENABLE_PIO_DMG_BUTTONS
-        pio_sm_put(pio_dmg_emu_buttons, dmg_emu_buttons_sm, pio_buttons_out_value);
-#endif
-
-#if ENABLE_CPU_DMG_BUTTONS
-        // Keep legacy GPIO mirroring in sync if ever re-enabled
-        nes_classic_controller();
-#endif
 
         sleep_until(next_frame_time);
         absolute_time_t now = get_absolute_time();
@@ -651,44 +1327,12 @@ int main(void)
     __builtin_unreachable();
 }
 
-#if ENABLE_PIO_DMG_BUTTONS
-static void initialize_dmg_emu_buttons_pio_program(void)
-{
-    static const uint start_in_pin = DMG_READING_BUTTONS_PIN;
-    static const uint start_out_pin = DMG_OUTPUT_RIGHT_A_PIN;
-
-    // Get first free state machine in PIO 0
-    dmg_emu_buttons_sm = pio_claim_unused_sm(pio_dmg_emu_buttons, true);
-
-    // Add PIO program to PIO instruction memory. SDK will find location and
-    // return with the memory offset of the program.
-    uint offset = pio_add_program(pio_dmg_emu_buttons, &dmg_emu_buttons_program);
-
-    // Calculate the PIO clock divider
-    // float div = (float)clock_get_hz(clk_sys) / pio_freq;
-    float div = (float)2;
-
-    // Initialize the program using the helper function in our .pio file
-    dmg_emu_buttons_program_init(pio_dmg_emu_buttons, dmg_emu_buttons_sm, offset, start_in_pin, start_out_pin, div);
-
-    // Start running our PIO program in the state machine
-    pio_sm_set_enabled(pio_dmg_emu_buttons, dmg_emu_buttons_sm, true);
-}
-#endif
-
 static void initialize_gpio(void)
 {    
     //Onboard LED
     gpio_init(ONBOARD_LED_PIN);
     gpio_set_dir(ONBOARD_LED_PIN, GPIO_OUT);
     gpio_put(ONBOARD_LED_PIN, 0);
-
-    // Gameboy video signal inputs
-    gpio_init(VSYNC_PIN);
-    gpio_init(PIXEL_CLOCK_PIN);
-    gpio_init(DATA_0_PIN);
-    gpio_init(DATA_1_PIN);
-    gpio_init(HSYNC_PIN);
 
     //Initialize I2C port at 400 kHz
     i2c_init(i2cHandle, 400 * 1000);
@@ -698,30 +1342,6 @@ static void initialize_gpio(void)
     gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(SCL_PIN);
     gpio_pull_up(SDA_PIN);
-
-#if ENABLE_CPU_DMG_BUTTONS
-    gpio_init(DMG_OUTPUT_RIGHT_A_PIN);
-    gpio_set_dir(DMG_OUTPUT_RIGHT_A_PIN, GPIO_OUT);
-    gpio_put(DMG_OUTPUT_RIGHT_A_PIN, 1);
-
-    gpio_init(DMG_OUTPUT_LEFT_B_PIN);
-    gpio_set_dir(DMG_OUTPUT_LEFT_B_PIN, GPIO_OUT);
-    gpio_put(DMG_OUTPUT_LEFT_B_PIN, 1);
-
-    gpio_init(DMG_OUTPUT_UP_SELECT_PIN);
-    gpio_set_dir(DMG_OUTPUT_UP_SELECT_PIN, GPIO_OUT);
-    gpio_put(DMG_OUTPUT_UP_SELECT_PIN, 1);
-
-    gpio_init(DMG_OUTPUT_DOWN_START_PIN);
-    gpio_set_dir(DMG_OUTPUT_DOWN_START_PIN, GPIO_OUT);
-    gpio_put(DMG_OUTPUT_DOWN_START_PIN, 1);
-
-    gpio_init(DMG_READING_DPAD_PIN);
-    gpio_set_dir(DMG_READING_DPAD_PIN, GPIO_IN);
-
-    gpio_init(DMG_READING_BUTTONS_PIN);
-    gpio_set_dir(DMG_READING_BUTTONS_PIN, GPIO_IN);
-#endif // ENABLE_CPU_DMG_BUTTONS
 }
 
 // static bool nes_classic_controller(void)
@@ -832,106 +1452,8 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
     gpio_put(ONBOARD_LED_PIN, buttondown);
 #endif
 
-    uint8_t pins_dpad = 0;
-    uint8_t pins_other = 0;
-    if (button_states[BUTTON_A] == BUTTON_STATE_PRESSED)
-        pins_other |= BIT_RIGHT_A;
-
-    if (button_states[BUTTON_B] == BUTTON_STATE_PRESSED)
-        pins_other |= BIT_LEFT_B;
-    
-    if (button_states[BUTTON_SELECT] == BUTTON_STATE_PRESSED)
-        pins_other |= BIT_UP_SELECT;
-    
-    if (button_states[BUTTON_START] == BUTTON_STATE_PRESSED)
-        pins_other |= BIT_DOWN_START;
-
-    if (button_states[BUTTON_UP] == BUTTON_STATE_PRESSED)
-        pins_dpad |= BIT_UP_SELECT;
-
-    if (button_states[BUTTON_DOWN] == BUTTON_STATE_PRESSED)
-        pins_dpad |= BIT_DOWN_START;
-    
-    if (button_states[BUTTON_LEFT] == BUTTON_STATE_PRESSED)
-        pins_dpad |= BIT_LEFT_B;
-    
-    if (button_states[BUTTON_RIGHT] == BUTTON_STATE_PRESSED)
-        pins_dpad |= BIT_RIGHT_A;
-
-#if ENABLE_PIO_DMG_BUTTONS
-    uint8_t pio_report = ~((pins_dpad << 4) | (pins_other&0xF));
-    pio_buttons_out_value = (uint32_t)pio_report;
-#endif
-
     return true;
 }
-
-#if ENABLE_CPU_DMG_BUTTONS
-static void __no_inline_not_in_flash_func(gpio_callback)(uint gpio, uint32_t events)
-{
-#if ENABLE_VIDEO_CAPTURE && USE_VSYNC_IRQ
-    // Handle VSYNC IRQ for video capture (GPIO 4) - ONLY IN IRQ MODE
-    if (gpio == VSYNC_PIN) {
-        video_capture_handle_vsync_irq(events);
-        return;  // VSYNC handled, done
-    }
-#endif
-
-    // Prevent controller input to game if OSD is visible
-#if ENABLE_OSD
-    if (OSD_is_enabled())
-        return;
-#endif // ENABLE_OSD
-
-    if(gpio==DMG_READING_DPAD_PIN)
-    {
-        if (events & GPIO_IRQ_EDGE_FALL)   // Send DPAD states on low
-        {
-            if (gpio_get(DMG_READING_BUTTONS_PIN) == 1)
-            {
-
-                gpio_put(DMG_OUTPUT_RIGHT_A_PIN, button_states[BUTTON_RIGHT]);
-                gpio_put(DMG_OUTPUT_LEFT_B_PIN, button_states[BUTTON_LEFT]);
-                gpio_put(DMG_OUTPUT_UP_SELECT_PIN, button_states[BUTTON_UP]);
-                gpio_put(DMG_OUTPUT_DOWN_START_PIN, button_states[BUTTON_DOWN]);
-            }
-        }
-
-        if (events & GPIO_IRQ_EDGE_RISE)   // Send BUTTON states on low
-        {
-            // When P15 pin goes high, read cycle is complete, send all high
-            if(gpio_get(DMG_READING_BUTTONS_PIN) == 1)
-            {
-                gpio_put(DMG_OUTPUT_RIGHT_A_PIN, 1);
-                gpio_put(DMG_OUTPUT_LEFT_B_PIN, 1);
-                gpio_put(DMG_OUTPUT_UP_SELECT_PIN, 1);
-                gpio_put(DMG_OUTPUT_DOWN_START_PIN, 1);
-            }
-        }
-    }
-
-    if(gpio==DMG_READING_BUTTONS_PIN)
-    {
-        if (events & GPIO_IRQ_EDGE_FALL)   // Send BUTTON states on low
-        {
-            gpio_put(DMG_OUTPUT_RIGHT_A_PIN, button_states[BUTTON_A]);
-            gpio_put(DMG_OUTPUT_LEFT_B_PIN, button_states[BUTTON_B]);
-            gpio_put(DMG_OUTPUT_UP_SELECT_PIN, button_states[BUTTON_SELECT]);
-            gpio_put(DMG_OUTPUT_DOWN_START_PIN, button_states[BUTTON_START]);
-
-            // Prevent in-game reset lockup
-            // If A,B,Select and Start are all pressed, release them!
-            if ((button_states[BUTTON_A] | button_states[BUTTON_B] | button_states[BUTTON_SELECT]| button_states[BUTTON_START])==0)
-            {
-                button_states[BUTTON_A] = 1;
-                button_states[BUTTON_B] = 1;
-                button_states[BUTTON_SELECT] = 1;
-                button_states[BUTTON_START] = 1;
-            }
-        }
-    }
-}
-#endif // ENABLE_CPU_DMG_BUTTONS
 
 // Palette support for both 640x480 and 800x600 modes
 static void set_game_palette(int index)
@@ -945,4 +1467,13 @@ static void set_game_palette(int index)
     // Set RGB888 palette pointer for 2bpp palette mode
     // Works for both 640x480 (no borders) and 800x600 (with borders)
     dvi_get_blank_settings(&dvi0)->palette_rgb888 = game_palette_rgb888;
+}
+
+static void sd_stream_chunk_yield(void)
+{
+    // Allow other subsystems (controller polling, audio) to make progress between SD chunks.
+#if ENABLE_AUDIO
+    pump_audio_samples();
+#endif
+    tight_loop_contents();
 }

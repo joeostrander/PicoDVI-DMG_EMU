@@ -22,5 +22,6 @@ include_directories(
 
 add_subdirectory(libdvi)
 add_subdirectory(libsprite)
+add_subdirectory(ext/FatFs_SPI)
 
 add_subdirectory(apps)
