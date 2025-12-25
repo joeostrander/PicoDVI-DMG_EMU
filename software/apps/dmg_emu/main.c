@@ -39,10 +39,13 @@ TODO:
 #include "hardware/i2c.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
+#include "hardware/clocks.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "pico/stdio.h"
+#include "pico/stdio_uart.h"
 #include "pico/platform.h"
+#include "pico/stdio_uart.h"
 
 #include "dvi.h"
 #include "dvi_serialiser.h"
@@ -55,14 +58,14 @@ TODO:
 #include "colors.h"
 #include "hedley.h"
 #include "board_pins.h"
+// #include "hw_config.h"
+#include "sdcard.h"
 #include "ff.h"
 #include "f_util.h"
-#include "hw_config.h"
-#include "sd_card.h"
 #include "diskio.h"
 
 #define SAMPLE_FREQ                 32768
-#define AUDIO_BUFFER_SIZE           2048
+#define AUDIO_BUFFER_SIZE           1024
 #define AUDIO_SAMPLE_RATE           SAMPLE_FREQ
 #define ENABLE_SOUND                1
 #define DMG_FRAME_DURATION_US       ((uint32_t)(1000000.0 / VERTICAL_SYNC + 0.5))
@@ -82,12 +85,24 @@ TODO:
 
 #define ENABLE_AUDIO                1  // Enable Peanut-GB audio path
 #define ENABLE_OSD                  0  // Set to 1 to enable OSD code, 0 to disable (TODO)
+#define ENABLE_SD_STATS_LOG         0  // Set to 1 to print periodic SD cache hit/miss stats
+#define ENABLE_HEAP_LOG             0  // Set to 1 to print free-heap checkpoints
 
 #define MAX_SD_ROM_FILE_BYTES       (ROM_BANK_SIZE * 512u)
-#define MAX_SD_ROM_HEAP_BYTES       (192u * 1024u)
-#define SD_HEAP_SAFETY_MARGIN_BYTES (32u * 1024u)
-#define SD_ROM_CACHE_SLOTS          2u
-#define SD_STREAM_CHUNK_BYTES       256u
+#define MAX_SD_ROM_HEAP_BYTES       (320u * 1024u)  // allow 256 KB ROMs to heap-load
+#define SD_HEAP_SAFETY_MARGIN_BYTES (8u * 1024u)
+#define SD_ROM_CACHE_SLOTS          8u    // larger cache to cut bank thrash on streamed carts
+#define SD_STREAM_CHUNK_BYTES       4096u // balanced chunk to reduce overhead without long stalls
+#define ENABLE_SD_HEAP_LOAD         1   // 0 = always stream from SD to save RAM, 1 = allow heap copy when small enough
+#define MAX_SD_ROM_LIST             16u  // limit menu entries to save RAM
+#define MAX_SD_ROM_PATH_LEN         192u
+#define MENU_MAX_LABEL_CHARS        24u
+#define MENU_LINE_HEIGHT            8
+#define MENU_COLOR_BG               0u
+#define MENU_COLOR_FG               3u
+#define MENU_COLOR_HL_BG            2u
+#define MENU_COLOR_HL_FG            0u
+#define MENU_COLOR_TITLE            3u
 
 
 #if ENABLE_AUDIO
@@ -156,6 +171,11 @@ typedef struct
 } sd_rom_stream_state_t;
 
 static sd_rom_cache_slot_t sd_rom_cache[SD_ROM_CACHE_SLOTS];
+static char sd_rom_list[MAX_SD_ROM_LIST][MAX_SD_ROM_PATH_LEN];
+static uint32_t sd_rom_list_count = 0;
+static uint32_t sd_cache_hits = 0;
+static uint32_t sd_cache_misses = 0;
+static uint32_t sd_cache_log_frames = 0;
 
 static struct gb_s gb;
 static uint8_t rom_bank0[0x4000];
@@ -167,6 +187,15 @@ static char sd_rom_path[256] = {0};
 static const uint8_t *active_rom_data = ACTIVE_ROM_DATA;
 static size_t active_rom_length = ACTIVE_ROM_LEN;
 static rom_source_t active_rom_source = ROM_SOURCE_BUILTIN;
+static volatile bool gb_faulted = false;
+static struct
+{
+    enum gb_error_e code;
+    uint16_t val;
+    uint16_t pc;
+    uint16_t sp;
+    uint16_t rom_bank;
+} gb_fault_info = {0};
 static uint8_t *sd_rom_heap = NULL;
 static size_t sd_rom_heap_size = 0;
 static sd_rom_stream_state_t sd_rom_stream = {
@@ -185,7 +214,7 @@ static void update_emulator_inputs(void);
 static void swap_display_buffers(void);
 static void handle_palette_hotkeys(void);
 static bool mount_sd_card(void);
-static bool discover_sd_rom(void);
+// static bool discover_sd_rom(void);
 static bool load_sd_rom_file(const char *path);
 static void reset_active_rom_to_builtin(void);
 static void boot_checkpoint(const char *label);
@@ -196,6 +225,19 @@ static size_t estimate_free_heap_bytes(void);
 static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot);
 static uint8_t sd_stream_read_byte(size_t addr);
 static void sd_stream_chunk_yield(void);
+static void log_free_heap(const char *tag);
+static const char *path_basename(const char *path);
+static void clear_sd_rom_list(void);
+static uint32_t scan_directory_for_roms(const char *directory);
+static bool build_sd_rom_list(void);
+// static void print_sd_rom_list(void);
+static bool sd_rom_selection_menu(char *selected_path, size_t selected_len);
+
+
+static void initialize_gpio(void);
+
+static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
+static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
 
 
 typedef enum
@@ -310,7 +352,7 @@ static bool mount_sd_card(void)
 {
     printf("[SD] mount_sd_card entry\n");
 
-    if (sd_filesystem_ready && mounted_sd_card != NULL && mounted_sd_card->mounted) {
+    if (sd_filesystem_ready && mounted_sd_card != NULL && mounted_sd_card->state.mounted) {
         printf("SD mount skipped: already mounted.\n");
         return true;
     }
@@ -322,9 +364,13 @@ static bool mount_sd_card(void)
     }
 
     printf("Initializing SD card interface...\n");
-    set_spi_dma_irq_channel(true, true);
 
-    int status = sd_init(card);
+    if (!sd_init_driver()) {
+        printf("SD mount failed: sd_init_driver() did not succeed\n");
+        return false;
+    }
+
+    int status = card->init(card);
     if (status & STA_NODISK) {
         printf("SD mount failed: no card detected (status=0x%02x)\n", status);
         return false;
@@ -335,26 +381,27 @@ static bool mount_sd_card(void)
         return false;
     }
 
-    printf("Mounting FatFs volume on %s\n", card->pcName != NULL ? card->pcName : "<null>");
+    const char *drive_prefix = sd_get_drive_prefix(card);
+    printf("Mounting FatFs volume on %s\n", (drive_prefix != NULL && drive_prefix[0] != '\0') ? drive_prefix : "<null>");
 
-    FRESULT mount_result = f_mount(&card->fatfs, card->pcName, 1);
+    FRESULT mount_result = f_mount(&card->state.fatfs, drive_prefix, 1);
     if (mount_result != FR_OK) {
         printf("f_mount failed (%d: %s)\n", mount_result, FRESULT_str(mount_result));
-        card->mounted = false;
+        card->state.mounted = false;
         mounted_sd_card = NULL;
         sd_filesystem_ready = false;
         return false;
     }
 
-    if (card->pcName != NULL) {
-        FRESULT chdrive_result = f_chdrive(card->pcName);
+    if (drive_prefix != NULL && drive_prefix[0] != '\0') {
+        FRESULT chdrive_result = f_chdrive(drive_prefix);
         if (chdrive_result != FR_OK) {
             printf("f_chdrive failed (%d: %s) for %s\n",
                    chdrive_result,
                    FRESULT_str(chdrive_result),
-                   card->pcName);
-            f_mount(NULL, card->pcName, 0);
-            card->mounted = false;
+                   drive_prefix);
+            f_mount(NULL, drive_prefix, 0);
+            card->state.mounted = false;
             mounted_sd_card = NULL;
             sd_filesystem_ready = false;
             return false;
@@ -364,16 +411,16 @@ static bool mount_sd_card(void)
     FRESULT chdir_result = f_chdir("/");
     if (chdir_result != FR_OK) {
         printf("f_chdir('/') failed (%d: %s)\n", chdir_result, FRESULT_str(chdir_result));
-        if (card->pcName != NULL) {
-            f_mount(NULL, card->pcName, 0);
+        if (drive_prefix != NULL && drive_prefix[0] != '\0') {
+            f_mount(NULL, drive_prefix, 0);
         }
-        card->mounted = false;
+        card->state.mounted = false;
         mounted_sd_card = NULL;
         sd_filesystem_ready = false;
         return false;
     }
 
-    card->mounted = true;
+    card->state.mounted = true;
     mounted_sd_card = card;
     sd_filesystem_ready = true;
     sd_rom_discovered = false;
@@ -410,58 +457,58 @@ static bool filename_is_rom(const char *filename)
     return (third == 'c') && (ext[3] == '\0');  // .gbc
 }
 
-static bool find_first_rom_in_directory(const char *directory, char *out_path, size_t out_len)
-{
-    if ((directory == NULL) || (out_path == NULL) || (out_len == 0)) {
-        return false;
-    }
+// static bool find_first_rom_in_directory(const char *directory, char *out_path, size_t out_len)
+// {
+//     if ((directory == NULL) || (out_path == NULL) || (out_len == 0)) {
+//         return false;
+//     }
 
-    size_t dir_len = strlen(directory);
-    bool directory_has_sep = (dir_len > 0) && (directory[dir_len - 1] == '/' || directory[dir_len - 1] == '\\');
+//     size_t dir_len = strlen(directory);
+//     bool directory_has_sep = (dir_len > 0) && (directory[dir_len - 1] == '/' || directory[dir_len - 1] == '\\');
 
-    DIR dir;
-    FILINFO info;
-    memset(&info, 0, sizeof(info));
-    FRESULT fr = f_opendir(&dir, directory);
-    if (fr != FR_OK) {
-        return false;
-    }
+//     DIR dir;
+//     FILINFO info;
+//     memset(&info, 0, sizeof(info));
+//     FRESULT fr = f_opendir(&dir, directory);
+//     if (fr != FR_OK) {
+//         return false;
+//     }
 
-    bool found = false;
-    while (true) {
-        fr = f_readdir(&dir, &info);
-        if ((fr != FR_OK) || (info.fname[0] == '\0')) {
-            break;
-        }
+//     bool found = false;
+//     while (true) {
+//         fr = f_readdir(&dir, &info);
+//         if ((fr != FR_OK) || (info.fname[0] == '\0')) {
+//             break;
+//         }
 
-        if (info.fattrib & AM_DIR) {
-            continue;
-        }
+//         if (info.fattrib & AM_DIR) {
+//             continue;
+//         }
 
-        const char *name = (const char *)info.fname;
-#if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
-        if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
-            name = (const char *)info.altname;
-        }
-#endif
-        if ((name == NULL) || !filename_is_rom(name)) {
-            continue;
-        }
+//         const char *name = (const char *)info.fname;
+// #if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
+//         if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
+//             name = (const char *)info.altname;
+//         }
+// #endif
+//         if ((name == NULL) || !filename_is_rom(name)) {
+//             continue;
+//         }
 
-        const char *fmt = directory_has_sep ? "%s%s" : "%s/%s";
-        int needed = snprintf(out_path, out_len, fmt, directory, name);
-        if ((needed > 0) && ((size_t)needed < out_len)) {
-            found = true;
-        }
-        break;
-    }
+//         const char *fmt = directory_has_sep ? "%s%s" : "%s/%s";
+//         int needed = snprintf(out_path, out_len, fmt, directory, name);
+//         if ((needed > 0) && ((size_t)needed < out_len)) {
+//             found = true;
+//         }
+//         break;
+//     }
 
-    FRESULT close_result = f_closedir(&dir);
-    if ((close_result != FR_OK) && !found) {
-        printf("f_closedir failed (%d: %s) while scanning %s\n", close_result, FRESULT_str(close_result), directory);
-    }
-    return found;
-}
+//     FRESULT close_result = f_closedir(&dir);
+//     if ((close_result != FR_OK) && !found) {
+//         printf("f_closedir failed (%d: %s) while scanning %s\n", close_result, FRESULT_str(close_result), directory);
+//     }
+//     return found;
+// }
 
 static void log_roms_in_directory(const char *directory)
 {
@@ -518,12 +565,114 @@ static void log_roms_in_directory(const char *directory)
     }
 }
 
-static void dump_sd_rom_inventory(void)
+// static void dump_sd_rom_inventory(void)
+// {
+//     if (!sd_filesystem_ready) {
+//         printf("ROM scan skipped: filesystem not ready\n");
+//         return;
+//     }
+
+//     const char *search_paths[] = {
+//         "0:/ROMS",
+//         "0:/"
+//     };
+
+//     for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+//         log_roms_in_directory(search_paths[i]);
+//     }
+// }
+
+static void clear_sd_rom_list(void)
+{
+    sd_rom_list_count = 0;
+    for (uint32_t i = 0; i < MAX_SD_ROM_LIST; ++i) {
+        sd_rom_list[i][0] = '\0';
+    }
+}
+
+static bool add_rom_to_list(const char *directory, const char *filename)
+{
+    if ((directory == NULL) || (filename == NULL) || (sd_rom_list_count >= MAX_SD_ROM_LIST)) {
+        return false;
+    }
+
+    const size_t dir_len = strlen(directory);
+    const bool has_sep = (dir_len > 0) && (directory[dir_len - 1] == '/' || directory[dir_len - 1] == '\\');
+    char composed[MAX_SD_ROM_PATH_LEN];
+    const char *fmt = has_sep ? "%s%s" : "%s/%s";
+    int written = snprintf(composed, sizeof(composed), fmt, directory, filename);
+    if ((written <= 0) || ((size_t)written >= sizeof(composed))) {
+        return false;
+    }
+
+    // Avoid duplicates (same path)
+    for (uint32_t i = 0; i < sd_rom_list_count; ++i) {
+        if (strcmp(sd_rom_list[i], composed) == 0) {
+            return false;
+        }
+    }
+
+    strncpy(sd_rom_list[sd_rom_list_count], composed, MAX_SD_ROM_PATH_LEN - 1);
+    sd_rom_list[sd_rom_list_count][MAX_SD_ROM_PATH_LEN - 1] = '\0';
+    sd_rom_list_count++;
+    return true;
+}
+
+static uint32_t scan_directory_for_roms(const char *directory)
+{
+    if ((directory == NULL) || !sd_filesystem_ready) {
+        return 0;
+    }
+
+    DIR dir;
+    FILINFO info;
+    memset(&info, 0, sizeof(info));
+    FRESULT fr = f_opendir(&dir, directory);
+    if (fr != FR_OK) {
+        printf("ROM scan: unable to open %s (%d: %s)\n", directory, fr, FRESULT_str(fr));
+        return 0;
+    }
+
+    uint32_t added = 0;
+    while (sd_rom_list_count < MAX_SD_ROM_LIST) {
+        fr = f_readdir(&dir, &info);
+        if ((fr != FR_OK) || (info.fname[0] == '\0')) {
+            break;
+        }
+
+        if (info.fattrib & AM_DIR) {
+            continue;
+        }
+
+        const char *name = (const char *)info.fname;
+#if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
+        if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
+            name = (const char *)info.altname;
+        }
+#endif
+        if ((name == NULL) || !filename_is_rom(name)) {
+            continue;
+        }
+
+        if (add_rom_to_list(directory, name)) {
+            added++;
+        }
+    }
+
+    FRESULT close_result = f_closedir(&dir);
+    if (close_result != FR_OK) {
+        printf("ROM scan: close failed (%d: %s)\n", close_result, FRESULT_str(close_result));
+    }
+    return added;
+}
+
+static bool build_sd_rom_list(void)
 {
     if (!sd_filesystem_ready) {
-        printf("ROM scan skipped: filesystem not ready\n");
-        return;
+        return false;
     }
+
+    clear_sd_rom_list();
 
     const char *search_paths[] = {
         "0:/ROMS",
@@ -531,7 +680,343 @@ static void dump_sd_rom_inventory(void)
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
-        log_roms_in_directory(search_paths[i]);
+        scan_directory_for_roms(search_paths[i]);
+        if (sd_rom_list_count >= MAX_SD_ROM_LIST) {
+            break;
+        }
+    }
+
+    if (sd_rom_list_count > 0) {
+        strncpy(sd_rom_path, sd_rom_list[0], sizeof(sd_rom_path) - 1);
+        sd_rom_path[sizeof(sd_rom_path) - 1] = '\0';
+        sd_rom_discovered = true;
+        return true;
+    }
+
+    sd_rom_discovered = false;
+    sd_rom_path[0] = '\0';
+    return false;
+}
+
+static const char *path_basename(const char *path)
+{
+    if (path == NULL) {
+        return "";
+    }
+
+    const char *slash_fwd = strrchr(path, '/');
+    const char *slash_back = strrchr(path, '\\');
+
+    const char *base = NULL;
+    if (slash_fwd != NULL) {
+        base = slash_fwd;
+    }
+    if (slash_back != NULL && (slash_back > base)) {
+        base = slash_back;
+    }
+
+    if (base == NULL) {
+        return path;
+    }
+    return base + 1;
+}
+
+// static void print_sd_rom_list(void)
+// {
+//     if (sd_rom_list_count == 0) {
+//         printf("<no SD ROMs found>\n");
+//         return;
+//     }
+//
+//     printf("SD ROMs (%lu found, showing up to %u):\n", (unsigned long)sd_rom_list_count, (unsigned int)MAX_SD_ROM_LIST);
+//     for (uint32_t i = 0; i < sd_rom_list_count; ++i) {
+//         printf("  [%02lu] %s\n", (unsigned long)i, sd_rom_list[i]);
+//     }
+// }
+
+
+
+typedef struct
+{
+    char ch;
+    uint8_t rows[7];
+} glyph_5x7_t;
+
+#define GLYPH(_c, _r0, _r1, _r2, _r3, _r4, _r5, _r6) \
+    { (_c), { (_r0), (_r1), (_r2), (_r3), (_r4), (_r5), (_r6) } }
+
+static const glyph_5x7_t menu_font[] = {
+    GLYPH(' ', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+    GLYPH('?', 0x0E, 0x11, 0x02, 0x04, 0x04, 0x00, 0x04),
+    GLYPH('0', 0x1E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x1E),
+    GLYPH('1', 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    GLYPH('2', 0x1E, 0x01, 0x01, 0x0E, 0x10, 0x10, 0x1F),
+    GLYPH('3', 0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E),
+    GLYPH('4', 0x12, 0x12, 0x12, 0x1F, 0x02, 0x02, 0x02),
+    GLYPH('5', 0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E),
+    GLYPH('6', 0x0F, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+    GLYPH('7', 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    GLYPH('8', 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+    GLYPH('9', 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x1E),
+    GLYPH('A', 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    GLYPH('B', 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    GLYPH('C', 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    GLYPH('D', 0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    GLYPH('E', 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+    GLYPH('F', 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    GLYPH('G', 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E),
+    GLYPH('H', 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    GLYPH('I', 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    GLYPH('J', 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E),
+    GLYPH('K', 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+    GLYPH('L', 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    GLYPH('M', 0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11),
+    GLYPH('N', 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11),
+    GLYPH('O', 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    GLYPH('P', 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    GLYPH('Q', 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D),
+    GLYPH('R', 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    GLYPH('S', 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+    GLYPH('T', 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    GLYPH('U', 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    GLYPH('V', 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    GLYPH('W', 0x11, 0x11, 0x11, 0x11, 0x15, 0x1B, 0x11),
+    GLYPH('X', 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    GLYPH('Y', 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04),
+    GLYPH('Z', 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    GLYPH('-', 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
+    GLYPH('_', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F),
+    GLYPH('.', 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
+    GLYPH('\'', 0x06, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00),
+    GLYPH('/', 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00),
+    GLYPH('(', 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
+    GLYPH(')', 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08)
+};
+
+static const glyph_5x7_t *lookup_glyph(char c)
+{
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+
+    const size_t glyph_count = ARRAY_SIZE(menu_font);
+    for (size_t i = 0; i < glyph_count; ++i) {
+        if (menu_font[i].ch == c) {
+            return &menu_font[i];
+        }
+    }
+
+    return &menu_font[1]; // '?'
+}
+
+static inline void set_pixel_2bpp(uint8_t *buf, int x, int y, uint8_t color)
+{
+    if ((buf == NULL) || (x < 0) || (x >= DMG_PIXELS_X) || (y < 0) || (y >= DMG_PIXELS_Y)) {
+        return;
+    }
+
+    size_t idx = (size_t)y * PACKED_LINE_STRIDE_BYTES + (size_t)(x >> 2);
+    uint shift = (3u - (uint)(x & 3)) * 2u;
+    uint8_t mask = (uint8_t)(0x03u << shift);
+    buf[idx] = (uint8_t)((buf[idx] & ~mask) | ((color & 0x03u) << shift));
+}
+
+static void fill_buffer_2bpp(uint8_t *buf, uint8_t color)
+{
+    if (buf == NULL) {
+        return;
+    }
+
+    uint8_t packed = (uint8_t)(((color & 0x03u) << 6) | ((color & 0x03u) << 4) | ((color & 0x03u) << 2) | (color & 0x03u));
+    memset(buf, packed, PACKED_FRAME_SIZE);
+}
+
+static void draw_glyph_5x7(uint8_t *buf, int x, int y, const glyph_5x7_t *glyph, uint8_t fg, uint8_t bg)
+{
+    if ((buf == NULL) || (glyph == NULL)) {
+        return;
+    }
+
+    for (int row = 0; row < 7; ++row) {
+        uint8_t bits = glyph->rows[row];
+        for (int col = 0; col < 5; ++col) {
+            const bool on = (bits & (0x10 >> col)) != 0;
+            set_pixel_2bpp(buf, x + col, y + row, on ? fg : bg);
+        }
+        set_pixel_2bpp(buf, x + 5, y + row, bg); // 1px spacing
+    }
+}
+
+static void draw_text_line(uint8_t *buf, int x, int y, const char *text, uint8_t fg, uint8_t bg)
+{
+    if ((buf == NULL) || (text == NULL)) {
+        return;
+    }
+
+    int cursor_x = x;
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        if (cursor_x >= DMG_PIXELS_X) {
+            break;
+        }
+        const glyph_5x7_t *glyph = lookup_glyph(text[i]);
+        draw_glyph_5x7(buf, cursor_x, y, glyph, fg, bg);
+        cursor_x += 6; // 5 pixels plus spacing
+    }
+}
+
+static void format_rom_label(const char *path, char *out, size_t out_len)
+{
+    if ((out == NULL) || (out_len == 0)) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (path == NULL) {
+        return;
+    }
+
+    const char *base = path_basename(path);
+    char scratch[64];
+    strncpy(scratch, base, sizeof(scratch) - 1);
+    scratch[sizeof(scratch) - 1] = '\0';
+
+    char *dot = strrchr(scratch, '.');
+    if (dot != NULL) {
+        *dot = '\0';
+    }
+
+    size_t o = 0;
+    for (size_t i = 0; scratch[i] != '\0' && o < (out_len - 1) && o < (MENU_MAX_LABEL_CHARS - 1); ++i) {
+        char c = (char)toupper((unsigned char)scratch[i]);
+        bool allowed = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == ' ' || c == '-' || c == '_' || c == '.' || c == '/' ||
+                c == '(' || c == ')' || c == '\'');
+        if (!allowed) {
+            c = ' ';
+        }
+        out[o++] = c;
+    }
+
+    if (o == 0) {
+        strncpy(out, "<BLANK>", out_len - 1);
+        out[out_len - 1] = '\0';
+        return;
+    }
+
+    out[o] = '\0';
+}
+
+static void render_rom_menu(uint32_t selected_index)
+{
+    uint8_t *buf = packed_render_ptr;
+    fill_buffer_2bpp(buf, MENU_COLOR_BG);
+
+    draw_text_line(buf, 4, 4, "SELECT ROM", MENU_COLOR_TITLE, MENU_COLOR_BG);
+
+    const uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
+    uint32_t page_start = 0;
+    if (selected_index >= visible_rows) {
+        page_start = selected_index - visible_rows + 1;
+    }
+    if (sd_rom_list_count > visible_rows && (page_start + visible_rows) > sd_rom_list_count) {
+        page_start = sd_rom_list_count - visible_rows;
+    }
+
+    for (uint32_t row = 0; row < visible_rows && (page_start + row) < sd_rom_list_count; ++row) {
+        uint32_t idx = page_start + row;
+        char label[MENU_MAX_LABEL_CHARS];
+        format_rom_label(sd_rom_list[idx], label, sizeof(label));
+        const bool selected = (idx == selected_index);
+        uint8_t fg = selected ? MENU_COLOR_HL_FG : MENU_COLOR_FG;
+        uint8_t bg = selected ? MENU_COLOR_HL_BG : MENU_COLOR_BG;
+        draw_text_line(buf, 8, 16 + (int)row * MENU_LINE_HEIGHT, label, fg, bg);
+    }
+
+    draw_text_line(buf, 4, DMG_PIXELS_Y - 12, "A/START=LOAD  B=CANCEL", MENU_COLOR_FG, MENU_COLOR_BG);
+    swap_display_buffers();
+}
+
+static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
+{
+    if ((selected_path == NULL) || (selected_len == 0) || (sd_rom_list_count == 0)) {
+        return false;
+    }
+
+    uint32_t index = 0;
+    button_state_t last_up = BUTTON_STATE_UNPRESSED;
+    button_state_t last_down = BUTTON_STATE_UNPRESSED;
+    button_state_t last_a = BUTTON_STATE_UNPRESSED;
+    button_state_t last_start = BUTTON_STATE_UNPRESSED;
+    button_state_t last_b = BUTTON_STATE_UNPRESSED;
+    button_state_t last_home = BUTTON_STATE_UNPRESSED;
+    // absolute_time_t auto_select_deadline = make_timeout_time_ms(4000);
+    render_rom_menu(index);
+
+    while (true) {
+        nes_classic_controller();
+        handle_palette_hotkeys();
+
+        const button_state_t up = button_states[BUTTON_UP];
+        const button_state_t down = button_states[BUTTON_DOWN];
+        const button_state_t a = button_states[BUTTON_A];
+        const button_state_t b = button_states[BUTTON_B];
+        const button_state_t start = button_states[BUTTON_START];
+        const button_state_t home = button_states[BUTTON_HOME];
+
+        bool moved = false;
+        if ((up == BUTTON_STATE_PRESSED) && (last_up == BUTTON_STATE_UNPRESSED)) {
+            index = (index == 0) ? (sd_rom_list_count - 1) : (index - 1);
+            moved = true;
+        }
+        if ((down == BUTTON_STATE_PRESSED) && (last_down == BUTTON_STATE_UNPRESSED)) {
+            index = (index + 1u) % sd_rom_list_count;
+            moved = true;
+        }
+        if (moved) {
+            render_rom_menu(index);
+            // auto_select_deadline = make_timeout_time_ms(4000);
+        }
+
+        bool confirm = false;
+        if ((a == BUTTON_STATE_PRESSED) && (last_a == BUTTON_STATE_UNPRESSED)) {
+            confirm = true;
+        }
+        if ((start == BUTTON_STATE_PRESSED) && (last_start == BUTTON_STATE_UNPRESSED)) {
+            confirm = true;
+        }
+        if (confirm) {
+            strncpy(selected_path, sd_rom_list[index], selected_len - 1);
+            selected_path[selected_len - 1] = '\0';
+            render_rom_menu(index);
+            return true;
+        }
+
+        bool cancel = false;
+        if ((b == BUTTON_STATE_PRESSED) && (last_b == BUTTON_STATE_UNPRESSED)) {
+            cancel = true;
+        }
+        if ((home == BUTTON_STATE_PRESSED) && (last_home == BUTTON_STATE_UNPRESSED)) {
+            cancel = true;
+        }
+        if (cancel) {
+            return false;
+        }
+        
+        // if (time_reached(auto_select_deadline)) {
+        //     strncpy(selected_path, sd_rom_list[index], selected_len - 1);
+        //     selected_path[selected_len - 1] = '\0';
+        //     render_rom_menu(index);
+        //     return true;
+        // }
+
+        last_up = up;
+        last_down = down;
+        last_a = a;
+        last_b = b;
+        last_start = start;
+        last_home = home;
+
+        sleep_ms(40);
     }
 }
 
@@ -592,6 +1077,16 @@ static size_t estimate_free_heap_bytes(void)
     return (size_t)(stack_limit - heap_end);
 }
 
+static void log_free_heap(const char *tag)
+{
+#if ENABLE_HEAP_LOG
+    size_t free_bytes = estimate_free_heap_bytes();
+    printf("[MEM] %s free ~= %lu bytes\n", (tag != NULL) ? tag : "heap", (unsigned long)free_bytes);
+#else
+    (void)tag;
+#endif
+}
+
 static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot)
 {
     if (!sd_rom_stream.open) {
@@ -618,13 +1113,21 @@ static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot)
 
     uint8_t *dst = slot->data;
     size_t remaining = bytes_to_read;
+    int attempt = 0;
     while (remaining > 0) {
         size_t chunk = (remaining > SD_STREAM_CHUNK_BYTES) ? SD_STREAM_CHUNK_BYTES : remaining;
         UINT chunk_read = 0;
         fr = f_read(&sd_rom_stream.handle, dst, (UINT)chunk, &chunk_read);
         if ((fr != FR_OK) || (chunk_read != chunk)) {
-            printf("SD ROM cache read failed (bank=%lu chunk=%u): %s (%d)\n",
-                   (unsigned long)bank_index, (unsigned int)chunk, FRESULT_str(fr), fr);
+            if (attempt == 0) {
+                // Retry once on short/failed read
+                attempt++;
+                printf("SD ROM cache read retry (bank=%lu chunk=%u): %s (%d) read=%u\n",
+                       (unsigned long)bank_index, (unsigned int)chunk, FRESULT_str(fr), fr, (unsigned int)chunk_read);
+                continue;
+            }
+            printf("SD ROM cache read failed (bank=%lu chunk=%u): %s (%d) read=%u\n",
+                   (unsigned long)bank_index, (unsigned int)chunk, FRESULT_str(fr), fr, (unsigned int)chunk_read);
             close_sd_rom_stream();
             return false;
         }
@@ -666,49 +1169,59 @@ static uint8_t sd_stream_read_byte(size_t addr)
             if (bank_offset >= slot->bytes_valid) {
                 return 0xFF;
             }
+#if ENABLE_SD_STATS_LOG
+            sd_cache_hits++;
+#endif
             return slot->data[bank_offset];
         }
     }
 
+#if ENABLE_SD_STATS_LOG
+    sd_cache_misses++;
+#endif
+
     sd_rom_cache_slot_t *slot = &sd_rom_cache[sd_rom_stream.next_replace_slot];
     if (!sd_stream_load_bank(bank_index, slot)) {
+        printf("SD stream load failed for bank=%lu addr=%lu\n", (unsigned long)bank_index, (unsigned long)addr);
         return 0xFF;
     }
     sd_rom_stream.next_replace_slot = (sd_rom_stream.next_replace_slot + 1u) % SD_ROM_CACHE_SLOTS;
 
     if (bank_offset >= slot->bytes_valid) {
+        printf("SD stream bank offset beyond valid data (bank=%lu offset=%lu valid=%lu)\n",
+               (unsigned long)bank_index, (unsigned long)bank_offset, (unsigned long)slot->bytes_valid);
         return 0xFF;
     }
     return slot->data[bank_offset];
 }
 
-static bool discover_sd_rom(void)
-{
-    if (!sd_filesystem_ready) {
-        return false;
-    }
+// static bool discover_sd_rom(void)
+// {
+//     if (!sd_filesystem_ready) {
+//         return false;
+//     }
 
-    dump_sd_rom_inventory();
+//     dump_sd_rom_inventory();
 
-    const char *search_paths[] = {
-        "0:/ROMS",
-        "0:/"
-    };
+//     const char *search_paths[] = {
+//         "0:/ROMS",
+//         "0:/"
+//     };
 
-    for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
-        if (find_first_rom_in_directory(search_paths[i], sd_rom_path, sizeof(sd_rom_path))) {
-            printf("Found SD ROM: %s\n", sd_rom_path);
-            sd_rom_discovered = true;
-            boot_checkpoint("discover_sd_rom about to return true");
-            return true;
-        }
-    }
+//     for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+//         if (find_first_rom_in_directory(search_paths[i], sd_rom_path, sizeof(sd_rom_path))) {
+//             printf("Found SD ROM: %s\n", sd_rom_path);
+//             sd_rom_discovered = true;
+//             boot_checkpoint("discover_sd_rom about to return true");
+//             return true;
+//         }
+//     }
 
-    printf("No .gb/.gbc files found on SD card (checked /ROMS and root).\n");
-    sd_rom_discovered = false;
-    sd_rom_path[0] = '\0';
-    return false;
-}
+//     printf("No .gb/.gbc files found on SD card (checked /ROMS and root).\n");
+//     sd_rom_discovered = false;
+//     sd_rom_path[0] = '\0';
+//     return false;
+// }
 
 static void reset_active_rom_to_builtin(void)
 {
@@ -716,6 +1229,7 @@ static void reset_active_rom_to_builtin(void)
     active_rom_data = ACTIVE_ROM_DATA;
     active_rom_length = ACTIVE_ROM_LEN;
     active_rom_source = ROM_SOURCE_BUILTIN;
+    gb_faulted = false;
     close_sd_rom_stream();
     free_sd_rom_heap();
 }
@@ -767,17 +1281,23 @@ static bool load_sd_rom_file(const char *path)
     }
 
     size_t rom_size_bytes = sd_rom_stream.size_bytes;
+
+#if ENABLE_SD_HEAP_LOAD
     size_t approx_free_heap = estimate_free_heap_bytes();
     bool rom_within_heap_limit = (rom_size_bytes <= MAX_SD_ROM_HEAP_BYTES);
     size_t required_with_margin = rom_size_bytes + SD_HEAP_SAFETY_MARGIN_BYTES;
-    bool heap_headroom_ok = approx_free_heap > required_with_margin;
 
     if (!rom_within_heap_limit) {
         printf("SD ROM heap load skipped: %lu bytes exceeds limit (%u)\n",
                (unsigned long)rom_size_bytes, (unsigned int)MAX_SD_ROM_HEAP_BYTES);
     }
 
-    if (rom_within_heap_limit && heap_headroom_ok) {
+    if (rom_within_heap_limit) {
+        printf("Heap try: need ~%lu (incl. margin), free ~%lu\n",
+               (unsigned long)required_with_margin, (unsigned long)approx_free_heap);
+        if (required_with_margin > approx_free_heap) {
+            printf("Heap load skipped: insufficient headroom, will stream from SD.\n");
+        } else {
         boot_checkpoint("Attempting heap load");
         uint8_t *heap_buffer = (uint8_t *)malloc(rom_size_bytes);
         if (heap_buffer != NULL) {
@@ -814,6 +1334,7 @@ static bool load_sd_rom_file(const char *path)
                 active_rom_source = ROM_SOURCE_SD_HEAP;
                 active_rom_data = sd_rom_heap;
                 active_rom_length = rom_size_bytes;
+                gb_faulted = false;
                 printf("Loaded SD ROM into heap (%lu bytes)\n", (unsigned long)rom_size_bytes);
                 return true;
             }
@@ -833,11 +1354,11 @@ static bool load_sd_rom_file(const char *path)
                 return false;
             }
         }
-    } else if (rom_within_heap_limit) {
-        printf("SD ROM heap load skipped: need ~%lu bytes (incl. margin), free ~%lu\n",
-               (unsigned long)required_with_margin,
-               (unsigned long)approx_free_heap);
+        }
     }
+#else
+    printf("SD ROM heap load disabled (streaming from SD to save RAM).\n");
+#endif
 
     sd_rom_stream.bank_count = (uint32_t)((sd_rom_stream.size_bytes + ROM_BANK_SIZE - 1u) / ROM_BANK_SIZE);
     if (sd_rom_stream.bank_count == 0) {
@@ -846,6 +1367,11 @@ static bool load_sd_rom_file(const char *path)
         return false;
     }
     boot_checkpoint("SD ROM stream initialized");
+
+    printf("Streaming SD ROM (%lu bytes) with %u banks; cache slots=%u\n",
+           (unsigned long)sd_rom_stream.size_bytes,
+           (unsigned int)sd_rom_stream.bank_count,
+           (unsigned int)SD_ROM_CACHE_SLOTS);
 
     invalidate_sd_rom_cache();
     FRESULT seek_res = f_lseek(&sd_rom_stream.handle, 0);
@@ -866,6 +1392,23 @@ static bool load_sd_rom_file(const char *path)
 
     printf("SD ROM load: copied %u bytes into bank 0\n", (unsigned int)bytes_read);
 
+    char title_buf[17];
+    for (size_t i = 0; i < sizeof(title_buf) - 1; ++i) {
+        uint8_t c = rom_bank0[0x134 + i];
+        if ((c < 0x20) || (c > 0x7E)) {
+            c = '.';
+        }
+        title_buf[i] = (char)c;
+    }
+    title_buf[16] = '\0';
+
+    uint8_t cart_type = rom_bank0[0x147];
+    uint8_t rom_code = rom_bank0[0x148];
+    uint8_t ram_code = rom_bank0[0x149];
+    uint8_t version = rom_bank0[0x14C];
+    printf("ROM header: title=\"%s\" cart=0x%02x rom_code=0x%02x ram_code=0x%02x version=0x%02x\n",
+           title_buf, cart_type, rom_code, ram_code, version);
+
     if (rom0_bytes < sizeof(rom_bank0)) {
         memset(rom_bank0 + rom0_bytes, 0xFF, sizeof(rom_bank0) - rom0_bytes);
     }
@@ -873,6 +1416,7 @@ static bool load_sd_rom_file(const char *path)
     active_rom_source = ROM_SOURCE_SD_STREAM;
     active_rom_data = NULL;
     active_rom_length = sd_rom_stream.size_bytes;
+    gb_faulted = false;
 
     // printf("Streaming SD ROM (%lu bytes) from %s\n", (unsigned long)sd_rom_stream.size_bytes, path);
 
@@ -883,12 +1427,6 @@ static bool load_sd_rom_file(const char *path)
     boot_checkpoint("load_sd_rom_file about to return true");
     return true;
 }
-
-
-static void initialize_gpio(void);
-
-static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
-static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
 
 void core1_main(void)
 {
@@ -986,11 +1524,19 @@ static void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const u
 
 static void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val)
 {
-    (void)gb;
-    printf("Peanut-GB error %d (val=%u)\n", gb_err, val);
-    while (true) {
-        tight_loop_contents();
-    }
+    gb_fault_info.code = gb_err;
+    gb_fault_info.val = val;
+    gb_fault_info.pc = gb->cpu_reg.pc.reg;
+    gb_fault_info.sp = gb->cpu_reg.sp.reg;
+    gb_fault_info.rom_bank = gb->selected_rom_bank;
+    gb_faulted = true;
+    printf("Peanut-GB error %d val=0x%04x pc=0x%04x sp=0x%04x rom_bank=%u source=%d\n",
+           gb_err,
+           (unsigned int)val,
+           (unsigned int)gb_fault_info.pc,
+           (unsigned int)gb_fault_info.sp,
+           (unsigned int)gb_fault_info.rom_bank,
+           (int)active_rom_source);
 }
 
 static void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line)
@@ -1086,6 +1632,9 @@ static void run_emulator_frame(void)
     do {
         __gb_step_cpu(&gb);
         tight_loop_contents();
+        if (gb_faulted) {
+            return;
+        }
     } while (gb.gb_frame == 0);
 }
 
@@ -1176,11 +1725,13 @@ int main(void)
     vreg_set_voltage(VREG_VSEL);
     sleep_ms(10);
     set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
+    log_free_heap("after clock init");
 
     for (int i = 0; i < BUTTON_COUNT; i++)
     {
         button_states[i] = BUTTON_STATE_UNPRESSED;
     }
+ 
     
     stdio_init_all();
     // uart_init(uart0, 115200);
@@ -1192,6 +1743,12 @@ int main(void)
 
 
     reset_active_rom_to_builtin();
+    log_free_heap("after reset_active_rom_to_builtin");
+
+    // Initialize controller I2C and LED before any menu interaction
+    boot_checkpoint("Initializing GPIO");
+    initialize_gpio();
+    boot_checkpoint("GPIO initialized");
 
 
     for (int i = 0; i < 5; i++) {
@@ -1222,24 +1779,23 @@ int main(void)
     boot_checkpoint("Calling mount_sd_card");
     bool sd_mount_ok = mount_sd_card();
     boot_checkpoint("mount_sd_card returned");
+    log_free_heap("after mount_sd_card");
 
+    bool rom_list_ready = false;
     if (!sd_mount_ok) {
         printf("Continuing with built-in ROM image (SD unavailable).\n");
     } else {
-        if (discover_sd_rom()) {
-            boot_checkpoint("discover_sd_rom returned true");
-            printf("About to load SD ROM via load_sd_rom_file(): %s\n", sd_rom_path);
-            if (load_sd_rom_file(sd_rom_path)) {
-                boot_checkpoint("load_sd_rom_file returned true");
-                printf("load_sd_rom_file success for %s\n", sd_rom_path);
-                boot_checkpoint("SD ROM loaded into memory");
-            } else {
-                printf("SD ROM load failed - reverting to built-in image.\n");
-                reset_active_rom_to_builtin();
-            }
+        boot_checkpoint("Scanning SD for ROM list");
+        if (build_sd_rom_list()) {
+            boot_checkpoint("SD ROM list built");
+            printf("%lu ROM(s) discovered on SD card.\n", (unsigned long)sd_rom_list_count);
+            log_free_heap("after ROM list build");
+            rom_list_ready = true;
         } else {
-            boot_checkpoint("discover_sd_rom returned false");
-            printf("No SD ROM discovered - using built-in image.\n");
+            boot_checkpoint("No SD ROMs found");
+            printf("No SD ROMs found - using built-in image.\n");
+            reset_active_rom_to_builtin();
+            log_free_heap("after no SD ROM found");
         }
     }
     boot_checkpoint("SD stage complete");
@@ -1249,6 +1805,7 @@ int main(void)
     dvi0.scanline_callback = core1_scanline_callback;
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
     boot_checkpoint("DVI configured");
+    log_free_heap("after DVI init");
 
     set_game_palette(SCHEME_SGB_4H);
 
@@ -1287,25 +1844,80 @@ int main(void)
     multicore_launch_core1(core1_main);
     boot_checkpoint("Core 1 running - now consuming video");
 
-    boot_checkpoint("Initializing GPIO");
-    initialize_gpio();
-    boot_checkpoint("GPIO initialized");
+    if (rom_list_ready) {
+        boot_checkpoint("Displaying SD ROM menu");
+        bool user_selected_rom = sd_rom_selection_menu(sd_rom_path, sizeof(sd_rom_path));
+        if (user_selected_rom) {
+            boot_checkpoint("User selected SD ROM");
+            printf("About to load SD ROM: %s\n", sd_rom_path);
+            if (load_sd_rom_file(sd_rom_path)) {
+                boot_checkpoint("load_sd_rom_file returned true");
+                printf("load_sd_rom_file success for %s\n", sd_rom_path);
+                boot_checkpoint("SD ROM loaded into memory");
+                log_free_heap("after SD ROM load");
+            } else {
+                printf("SD ROM load failed - reverting to built-in image.\n");
+                reset_active_rom_to_builtin();
+                log_free_heap("after SD ROM load failure fallback");
+            }
+        } else {
+            boot_checkpoint("SD ROM selection skipped");
+            printf("User declined SD ROM - using built-in image.\n");
+            reset_active_rom_to_builtin();
+            log_free_heap("after user skipped SD ROM");
+        }
+    }
 
     if (!init_peanut_emulator()) {
         while (1) {
             tight_loop_contents();
         }
     }
+    log_free_heap("after gb init");
     boot_checkpoint("Peanut-GB initialized");
     printf("Peanut-GB initialized - entering main loop\n");
 
+#if ENABLE_AUDIO
+    // Reset and prime audio ring with a few frames to avoid startup underflow on some boots.
+    set_read_offset(&dvi0.audio_ring, 0);
+    set_write_offset(&dvi0.audio_ring, 0);
+    memset(audio_buffer, 0, sizeof(audio_buffer));
+    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE / 2);
+    for (int i = 0; i < 4; ++i) {
+        pump_audio_samples();
+    }
+#endif
+
     absolute_time_t next_frame_time = make_timeout_time_us(DMG_FRAME_DURATION_US);
+
+    uint32_t frame_counter = 0;
 
     while (true)
     {
         nes_classic_controller();
         update_emulator_inputs();
         run_emulator_frame();
+        frame_counter++;
+    #if ENABLE_SD_STATS_LOG
+        if ((frame_counter % 120u) == 0) { // roughly every 2 seconds at 60fps
+            sd_cache_log_frames++;
+            printf("[SD] cache hits=%lu misses=%lu interval=%lu frames\n",
+               (unsigned long)sd_cache_hits,
+               (unsigned long)sd_cache_misses,
+               (unsigned long)sd_cache_log_frames * 120u);
+            sd_cache_hits = 0;
+            sd_cache_misses = 0;
+            sd_cache_log_frames = 0;
+        }
+    #endif
+        if (gb_faulted) {
+            printf("Emulator halted after Peanut-GB error %d (val=0x%04x)\n",
+                   (int)gb_fault_info.code,
+                   (unsigned int)gb_fault_info.val);
+            while (true) {
+                tight_loop_contents();
+            }
+        }
     #if ENABLE_AUDIO
         pump_audio_samples();
     #endif

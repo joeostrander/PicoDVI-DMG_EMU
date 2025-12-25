@@ -38,7 +38,7 @@
 /* This option switches fast seek function. (0:Disable or 1:Enable) */
 
 
-#define FF_USE_EXPAND	0
+#define FF_USE_EXPAND	1
 /* This option switches f_expand function. (0:Disable or 1:Enable) */
 
 
@@ -166,7 +166,7 @@
 / Drive/Volume Configurations
 /---------------------------------------------------------------------------*/
 
-# define FF_VOLUMES		2
+# define FF_VOLUMES		4
 /* Number of volumes (logical drives) to be used. (1-10) */
 
 

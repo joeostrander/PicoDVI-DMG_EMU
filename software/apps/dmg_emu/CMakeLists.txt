@@ -4,7 +4,6 @@
 
 add_executable(dmg_emu
     main.c
-    hw_config.c
     shared_dma_handler.c
     colors.c
     audio/minigb_apu.c
@@ -15,7 +14,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(dmg_emu PRIVATE -Wall)
 
 # Set resolution mode (change this to switch between modes)
-set(RESOLUTION_800x600 1)  # Set to 1 for 800x600, 0 for 640x480
+set(RESOLUTION_800x600 0)  # Set to 1 for 800x600, 0 for 640x480
 
 # Automatically set DVI_VERTICAL_REPEAT based on resolution
 if(RESOLUTION_800x600)
@@ -40,9 +39,24 @@ target_link_libraries(dmg_emu
     libsprite
     hardware_pio
     hardware_i2c
+    hardware_uart
     hardware_irq
     hardware_dma
-    FatFs_SPI
+    no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
+)
+
+if(TARGET hardware_rtc)
+    target_link_libraries(dmg_emu hardware_rtc)
+elseif(TARGET pico_aon_timer)
+    target_link_libraries(dmg_emu pico_aon_timer)
+endif()
+
+# Ensure FatFs SPI headers are visible to this app
+target_include_directories(dmg_emu PRIVATE
+    ${CMAKE_SOURCE_DIR}/ext/FatFs_SPI
+    ${CMAKE_SOURCE_DIR}/ext/FatFs_SPI/include
+    ${CMAKE_SOURCE_DIR}/ext/FatFs_SPI/ff15/source
+    ${CMAKE_SOURCE_DIR}/ext/FatFs_SPI/sd_driver
 )
 
 # # Enable USB serial output for printf debugging

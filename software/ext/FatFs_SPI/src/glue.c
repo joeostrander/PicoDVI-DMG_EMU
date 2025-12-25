@@ -19,15 +19,13 @@ specific language governing permissions and limitations under the License.
 /* This is an example of glue functions to attach various exsisting      */
 /* storage control modules to the FatFs module with a defined API.       */
 /*-----------------------------------------------------------------------*/
-#include <stdio.h>
 //
-#include "ff.h" /* Obtains integer types */
-//
-#include "diskio.h" /* Declarations of disk functions */
 //
 #include "hw_config.h"
 #include "my_debug.h"
 #include "sd_card.h"
+//
+#include "diskio.h" /* Declarations of disk functions */
 
 #define TRACE_PRINTF(fmt, args...)
 //#define TRACE_PRINTF printf  // task_printf
@@ -36,13 +34,13 @@ specific language governing permissions and limitations under the License.
 /* Get Drive Status                                                      */
 /*-----------------------------------------------------------------------*/
 
-DSTATUS disk_status(BYTE pdrv /* Physical drive nmuber to identify the drive */
+DSTATUS disk_status(BYTE pdrv /* Physical drive number to identify the drive */
 ) {
     TRACE_PRINTF(">>> %s\n", __FUNCTION__);
-    sd_card_t *p_sd = sd_get_by_num(pdrv);
-    if (!p_sd) return RES_PARERR;
-    sd_card_detect(p_sd);   // Fast: just a GPIO read
-    return p_sd->m_Status;  // See http://elm-chan.org/fsw/ff/doc/dstat.html
+    sd_card_t *sd_card_p = sd_get_by_num(pdrv);
+    if (!sd_card_p) return RES_PARERR;
+    sd_card_detect(sd_card_p);   // Fast: just a GPIO read
+    return sd_card_p->state.m_Status;  // See http://elm-chan.org/fsw/ff/doc/dstat.html
 }
 
 /*-----------------------------------------------------------------------*/
@@ -50,12 +48,20 @@ DSTATUS disk_status(BYTE pdrv /* Physical drive nmuber to identify the drive */
 /*-----------------------------------------------------------------------*/
 
 DSTATUS disk_initialize(
-    BYTE pdrv /* Physical drive nmuber to identify the drive */
+    BYTE pdrv /* Physical drive number to identify the drive */
 ) {
     TRACE_PRINTF(">>> %s\n", __FUNCTION__);
-    sd_card_t *p_sd = sd_get_by_num(pdrv);
-    if (!p_sd) return RES_PARERR;
-    return sd_init(p_sd);  // See http://elm-chan.org/fsw/ff/doc/dstat.html
+
+    bool ok = sd_init_driver();
+    if (!ok) return RES_NOTRDY;
+
+    sd_card_t *sd_card_p = sd_get_by_num(pdrv);
+    if (!sd_card_p) return RES_PARERR;
+    DSTATUS ds = disk_status(pdrv);
+    if (STA_NODISK & ds) 
+        return ds;
+    // See http://elm-chan.org/fsw/ff/doc/dstat.html
+    return sd_card_p->init(sd_card_p);  
 }
 
 static int sdrc2dresult(int sd_rc) {
@@ -78,22 +84,22 @@ static int sdrc2dresult(int sd_rc) {
         case SD_BLOCK_DEVICE_ERROR_WRITE:
         default:
             return RES_ERROR;
-    }
-}
+            }
+        }
 
 /*-----------------------------------------------------------------------*/
 /* Read Sector(s)                                                        */
 /*-----------------------------------------------------------------------*/
 
-DRESULT disk_read(BYTE pdrv,  /* Physical drive nmuber to identify the drive */
+DRESULT disk_read(BYTE pdrv,  /* Physical drive number to identify the drive */
                   BYTE *buff, /* Data buffer to store read data */
                   LBA_t sector, /* Start sector in LBA */
                   UINT count    /* Number of sectors to read */
 ) {
     TRACE_PRINTF(">>> %s\n", __FUNCTION__);
-    sd_card_t *p_sd = sd_get_by_num(pdrv);
-    if (!p_sd) return RES_PARERR;
-    int rc = sd_read_blocks(p_sd, buff, sector, count);
+    sd_card_t *sd_card_p = sd_get_by_num(pdrv);
+    if (!sd_card_p) return RES_PARERR;
+    int rc = sd_card_p->read_blocks(sd_card_p, buff, sector, count);
     return sdrc2dresult(rc);
 }
 
@@ -103,15 +109,15 @@ DRESULT disk_read(BYTE pdrv,  /* Physical drive nmuber to identify the drive */
 
 #if FF_FS_READONLY == 0
 
-DRESULT disk_write(BYTE pdrv, /* Physical drive nmuber to identify the drive */
+DRESULT disk_write(BYTE pdrv, /* Physical drive number to identify the drive */
                    const BYTE *buff, /* Data to be written */
                    LBA_t sector,     /* Start sector in LBA */
                    UINT count        /* Number of sectors to write */
 ) {
     TRACE_PRINTF(">>> %s\n", __FUNCTION__);
-    sd_card_t *p_sd = sd_get_by_num(pdrv);
-    if (!p_sd) return RES_PARERR;
-    int rc = sd_write_blocks(p_sd, buff, sector, count);
+    sd_card_t *sd_card_p = sd_get_by_num(pdrv);
+    if (!sd_card_p) return RES_PARERR;
+    int rc = sd_card_p->write_blocks(sd_card_p, buff, sector, count);
     return sdrc2dresult(rc);
 }
 
@@ -121,13 +127,13 @@ DRESULT disk_write(BYTE pdrv, /* Physical drive nmuber to identify the drive */
 /* Miscellaneous Functions                                               */
 /*-----------------------------------------------------------------------*/
 
-DRESULT disk_ioctl(BYTE pdrv, /* Physical drive nmuber (0..) */
+DRESULT disk_ioctl(BYTE pdrv, /* Physical drive number (0..) */
                    BYTE cmd,  /* Control code */
                    void *buff /* Buffer to send/receive control data */
 ) {
     TRACE_PRINTF(">>> %s\n", __FUNCTION__);
-    sd_card_t *p_sd = sd_get_by_num(pdrv);
-    if (!p_sd) return RES_PARERR;
+    sd_card_t *sd_card_p = sd_get_by_num(pdrv);
+    if (!sd_card_p) return RES_PARERR;
     switch (cmd) {
         case GET_SECTOR_COUNT: {  // Retrieves number of available sectors, the
                                   // largest allowable LBA + 1, on the drive
@@ -137,7 +143,7 @@ DRESULT disk_ioctl(BYTE pdrv, /* Physical drive nmuber (0..) */
                                   // volume/partition to be created. It is
                                   // required when FF_USE_MKFS == 1.
             static LBA_t n;
-            n = sd_sectors(p_sd);
+            n = sd_card_p->get_num_sectors(sd_card_p);
             *(LBA_t *)buff = n;
             if (!n) return RES_ERROR;
             return RES_OK;
@@ -156,6 +162,7 @@ DRESULT disk_ioctl(BYTE pdrv, /* Physical drive nmuber (0..) */
             return RES_OK;
         }
         case CTRL_SYNC:
+            sd_card_p->sync(sd_card_p);
             return RES_OK;
         default:
             return RES_PARERR;

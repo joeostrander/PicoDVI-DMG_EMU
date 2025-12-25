@@ -8,7 +8,8 @@ REM cmake -G "MinGW Makefiles" -DPICO_SDK_PATH=/path/to/sdk -DPICO_PLATFORM=rp23
 REM cmake --build . --target dmg_emu
 echo.
 echo ===== Running CMake Configuration =====
-cmake -G "MinGW Makefiles" -DPICO_COPY_TO_RAM=1 -DPICO_PLATFORM=rp2040 ..
+REM cmake -G "MinGW Makefiles" -DPICO_COPY_TO_RAM=1 -DPICO_PLATFORM=rp2040 ..
+cmake -G "MinGW Makefiles" -DPICO_COPY_TO_RAM=1 -DPICO_PLATFORM=rp2350 -DPICO_BOARD=pico2 ..
 if %errorlevel% neq 0 (
     echo.
     echo *** CMAKE CONFIGURATION FAILED ***
@@ -44,4 +45,5 @@ if exist e:\ (
 
 echo.
 echo ===== ALL DONE =====
+cd %~dp0
 exit /b 0
