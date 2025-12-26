@@ -94,7 +94,7 @@ TODO:
 #define SD_ROM_CACHE_SLOTS          8u    // larger cache to cut bank thrash on streamed carts
 #define SD_STREAM_CHUNK_BYTES       4096u // balanced chunk to reduce overhead without long stalls
 #define ENABLE_SD_HEAP_LOAD         1   // 0 = always stream from SD to save RAM, 1 = allow heap copy when small enough
-#define MAX_SD_ROM_LIST             16u  // limit menu entries to save RAM
+#define MAX_SD_ROM_LIST             128u // max ROM entries to list from SD
 #define MAX_SD_ROM_PATH_LEN         192u
 #define MENU_MAX_LABEL_CHARS        24u
 #define MENU_LINE_HEIGHT            8
@@ -788,6 +788,7 @@ static const glyph_5x7_t menu_font[] = {
     GLYPH('_', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F),
     GLYPH('.', 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
     GLYPH('\'', 0x06, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00),
+    GLYPH('=', 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00),
     GLYPH('/', 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00),
     GLYPH('(', 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
     GLYPH(')', 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08)
@@ -913,14 +914,9 @@ static void render_rom_menu(uint32_t selected_index)
 
     draw_text_line(buf, 4, 4, "SELECT ROM", MENU_COLOR_TITLE, MENU_COLOR_BG);
 
-    const uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
-    uint32_t page_start = 0;
-    if (selected_index >= visible_rows) {
-        page_start = selected_index - visible_rows + 1;
-    }
-    if (sd_rom_list_count > visible_rows && (page_start + visible_rows) > sd_rom_list_count) {
-        page_start = sd_rom_list_count - visible_rows;
-    }
+    const uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT; // currently 14 rows
+    const uint32_t page = (selected_index / visible_rows);
+    uint32_t page_start = page * visible_rows;
 
     for (uint32_t row = 0; row < visible_rows && (page_start + row) < sd_rom_list_count; ++row) {
         uint32_t idx = page_start + row;
@@ -932,7 +928,7 @@ static void render_rom_menu(uint32_t selected_index)
         draw_text_line(buf, 8, 16 + (int)row * MENU_LINE_HEIGHT, label, fg, bg);
     }
 
-    draw_text_line(buf, 4, DMG_PIXELS_Y - 12, "A/START=LOAD  B=CANCEL", MENU_COLOR_FG, MENU_COLOR_BG);
+    draw_text_line(buf, 4, DMG_PIXELS_Y - 12, "L/R=PAGE  A/START=LOAD", MENU_COLOR_FG, MENU_COLOR_BG);
     swap_display_buffers();
 }
 
@@ -945,9 +941,10 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
     uint32_t index = 0;
     button_state_t last_up = BUTTON_STATE_UNPRESSED;
     button_state_t last_down = BUTTON_STATE_UNPRESSED;
+    button_state_t last_left = BUTTON_STATE_UNPRESSED;
+    button_state_t last_right = BUTTON_STATE_UNPRESSED;
     button_state_t last_a = BUTTON_STATE_UNPRESSED;
     button_state_t last_start = BUTTON_STATE_UNPRESSED;
-    button_state_t last_b = BUTTON_STATE_UNPRESSED;
     button_state_t last_home = BUTTON_STATE_UNPRESSED;
     // absolute_time_t auto_select_deadline = make_timeout_time_ms(4000);
     render_rom_menu(index);
@@ -958,8 +955,9 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
 
         const button_state_t up = button_states[BUTTON_UP];
         const button_state_t down = button_states[BUTTON_DOWN];
+        const button_state_t left = button_states[BUTTON_LEFT];
+        const button_state_t right = button_states[BUTTON_RIGHT];
         const button_state_t a = button_states[BUTTON_A];
-        const button_state_t b = button_states[BUTTON_B];
         const button_state_t start = button_states[BUTTON_START];
         const button_state_t home = button_states[BUTTON_HOME];
 
@@ -970,6 +968,35 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
         }
         if ((down == BUTTON_STATE_PRESSED) && (last_down == BUTTON_STATE_UNPRESSED)) {
             index = (index + 1u) % sd_rom_list_count;
+            moved = true;
+        }
+        if ((left == BUTTON_STATE_PRESSED) && (last_left == BUTTON_STATE_UNPRESSED)) {
+            uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
+            uint32_t page = index / visible_rows;
+            if (page == 0) {
+                // wrap to last page
+                uint32_t last_page = (sd_rom_list_count - 1) / visible_rows;
+                index = last_page * visible_rows;
+            } else {
+                index = (page - 1) * visible_rows;
+            }
+            if (index >= sd_rom_list_count) {
+                index = sd_rom_list_count - 1;
+            }
+            moved = true;
+        }
+        if ((right == BUTTON_STATE_PRESSED) && (last_right == BUTTON_STATE_UNPRESSED)) {
+            uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
+            uint32_t page = index / visible_rows;
+            uint32_t last_page = (sd_rom_list_count - 1) / visible_rows;
+            if (page >= last_page) {
+                index = 0;
+            } else {
+                index = (page + 1) * visible_rows;
+            }
+            if (index >= sd_rom_list_count) {
+                index = sd_rom_list_count - 1;
+            }
             moved = true;
         }
         if (moved) {
@@ -991,14 +1018,7 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
             return true;
         }
 
-        bool cancel = false;
-        if ((b == BUTTON_STATE_PRESSED) && (last_b == BUTTON_STATE_UNPRESSED)) {
-            cancel = true;
-        }
         if ((home == BUTTON_STATE_PRESSED) && (last_home == BUTTON_STATE_UNPRESSED)) {
-            cancel = true;
-        }
-        if (cancel) {
             return false;
         }
         
@@ -1011,8 +1031,9 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
 
         last_up = up;
         last_down = down;
+        last_left = left;
+        last_right = right;
         last_a = a;
-        last_b = b;
         last_start = start;
         last_home = home;
 
