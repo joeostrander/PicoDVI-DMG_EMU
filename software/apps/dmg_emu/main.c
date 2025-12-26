@@ -33,6 +33,7 @@ TODO:
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#include <hardware/watchdog.h>
 #include <stdint.h>
 #include <unistd.h>
 #include "hardware/vreg.h"
@@ -101,7 +102,7 @@ TODO:
 #define MENU_COLOR_BG               0u
 #define MENU_COLOR_FG               3u
 #define MENU_COLOR_HL_BG            2u
-#define MENU_COLOR_HL_FG            0u
+#define MENU_COLOR_HL_FG            1u
 #define MENU_COLOR_TITLE            3u
 
 
@@ -131,20 +132,28 @@ i2c_inst_t* i2cHandle = i2c1;
 #define DMG_PIXELS_Y                144
 #define DMG_PIXEL_COUNT             (DMG_PIXELS_X*DMG_PIXELS_Y)
 
-// Packed DMA buffers - 4 pixels per byte (2 bits each)
-// This is the native format from the Game Boy (2 bits per pixel)
-// Used by BOTH 640x480 and 800x600 modes for DMA capture AND display
-#define PACKED_FRAME_SIZE (DMG_PIXEL_COUNT / 4)  // 5760 bytes (160×144 ÷ 4)
-#define PACKED_LINE_STRIDE_BYTES (DMG_PIXELS_X / 4)
-static uint8_t packed_buffer_0[PACKED_FRAME_SIZE] = {0};
-static uint8_t packed_buffer_1[PACKED_FRAME_SIZE] = {0};
+//********************************************************************************
+// TYPEDEFS AND STRUCTS
+//********************************************************************************
+typedef enum
+{
+    BUTTON_A = 0,
+    BUTTON_B,
+    BUTTON_SELECT,
+    BUTTON_START,
+    BUTTON_UP,
+    BUTTON_DOWN,
+    BUTTON_LEFT,
+    BUTTON_RIGHT,
+    BUTTON_HOME,
+    BUTTON_COUNT
+} controller_button_t;
 
-// Both modes now use packed buffers directly!
-// TMDS encoder handles palette conversion and horizontal scaling
-// - 640x480: 4× scaling with grayscale/color palette
-// - 800x600: 5× scaling with RGB888 palette
-static volatile uint8_t* packed_display_ptr = packed_buffer_0;
-static uint8_t* packed_render_ptr = packed_buffer_1;
+typedef enum
+{
+    BUTTON_STATE_PRESSED = 0,
+    BUTTON_STATE_UNPRESSED
+} button_state_t;
 
 typedef enum
 {
@@ -170,12 +179,73 @@ typedef struct
     uint32_t next_replace_slot;
 } sd_rom_stream_state_t;
 
+
+
+//********************************************************************************
+// PRIVATE FUNCTION PROTOTYPES
+//********************************************************************************
+static void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line);
+static uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr);
+static uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr);
+static void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val);
+static void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val);
+static void update_emulator_inputs(void);
+static void swap_display_buffers(void);
+static bool mount_sd_card(void);
+// static bool discover_sd_rom(void);
+static bool load_sd_rom_file(const char *path);
+static void reset_active_rom_to_builtin(void);
+static void boot_checkpoint(const char *label);
+static void invalidate_sd_rom_cache(void);
+static void close_sd_rom_stream(void);
+static void free_sd_rom_heap(void);
+static size_t estimate_free_heap_bytes(void);
+static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot);
+static uint8_t sd_stream_read_byte(size_t addr);
+static void sd_stream_chunk_yield(void);
+static void log_free_heap(const char *tag);
+static bool ensure_audio_ready(void);
+static const char *path_basename(const char *path);
+static void clear_sd_rom_list(void);
+static uint32_t scan_directory_for_roms(const char *directory);
+static bool build_sd_rom_list(void);
+// static void print_sd_rom_list(void);
+static bool sd_rom_selection_menu(char *selected_path, size_t selected_len);
+static void initialize_gpio(void);
+static void reset_pico(void);
+static bool button_is_pressed(controller_button_t button);
+static bool button_was_released(controller_button_t button);
+static bool command_check(void);
+static void button_state_save_previous(void);
+static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
+static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
+
+//********************************************************************************
+// PRIVATE VARIABLES
+//********************************************************************************
+// Packed DMA buffers - 4 pixels per byte (2 bits each)
+// This is the native format from the Game Boy (2 bits per pixel)
+// Used by BOTH 640x480 and 800x600 modes for DMA capture AND display
+#define PACKED_FRAME_SIZE (DMG_PIXEL_COUNT / 4)  // 5760 bytes (160×144 ÷ 4)
+#define PACKED_LINE_STRIDE_BYTES (DMG_PIXELS_X / 4)
+static uint8_t packed_buffer_0[PACKED_FRAME_SIZE] = {0};
+static uint8_t packed_buffer_1[PACKED_FRAME_SIZE] = {0};
+
+// Both modes now use packed buffers directly!
+// TMDS encoder handles palette conversion and horizontal scaling
+// - 640x480: 4× scaling with grayscale/color palette
+// - 800x600: 5× scaling with RGB888 palette
+static volatile uint8_t* packed_display_ptr = packed_buffer_0;
+static uint8_t* packed_render_ptr = packed_buffer_1;
+
 static sd_rom_cache_slot_t sd_rom_cache[SD_ROM_CACHE_SLOTS];
 static char sd_rom_list[MAX_SD_ROM_LIST][MAX_SD_ROM_PATH_LEN];
 static uint32_t sd_rom_list_count = 0;
+#if ENABLE_SD_STATS_LOG
 static uint32_t sd_cache_hits = 0;
 static uint32_t sd_cache_misses = 0;
 static uint32_t sd_cache_log_frames = 0;
+#endif
 
 static struct gb_s gb;
 static uint8_t rom_bank0[0x4000];
@@ -205,62 +275,10 @@ static sd_rom_stream_state_t sd_rom_stream = {
     .next_replace_slot = 0
 };
 
-static void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line);
-static uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr);
-static uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr);
-static void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val);
-static void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val);
-static void update_emulator_inputs(void);
-static void swap_display_buffers(void);
-static void handle_palette_hotkeys(void);
-static bool mount_sd_card(void);
-// static bool discover_sd_rom(void);
-static bool load_sd_rom_file(const char *path);
-static void reset_active_rom_to_builtin(void);
-static void boot_checkpoint(const char *label);
-static void invalidate_sd_rom_cache(void);
-static void close_sd_rom_stream(void);
-static void free_sd_rom_heap(void);
-static size_t estimate_free_heap_bytes(void);
-static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot);
-static uint8_t sd_stream_read_byte(size_t addr);
-static void sd_stream_chunk_yield(void);
-static void log_free_heap(const char *tag);
-static const char *path_basename(const char *path);
-static void clear_sd_rom_list(void);
-static uint32_t scan_directory_for_roms(const char *directory);
-static bool build_sd_rom_list(void);
-// static void print_sd_rom_list(void);
-static bool sd_rom_selection_menu(char *selected_path, size_t selected_len);
 
-
-static void initialize_gpio(void);
-
-static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
-static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
-
-
-typedef enum
-{
-    BUTTON_A = 0,
-    BUTTON_B,
-    BUTTON_SELECT,
-    BUTTON_START,
-    BUTTON_UP,
-    BUTTON_DOWN,
-    BUTTON_LEFT,
-    BUTTON_RIGHT,
-    BUTTON_HOME,
-    BUTTON_COUNT
-} controller_button_t;
-
-typedef enum
-{
-    BUTTON_STATE_PRESSED = 0,
-    BUTTON_STATE_UNPRESSED
-} button_state_t;
 
 static uint8_t button_states[BUTTON_COUNT];
+static uint8_t button_states_previous[BUTTON_COUNT];
 
 #if RESOLUTION_800x600
 #define FRAME_WIDTH 800
@@ -510,60 +528,60 @@ static bool filename_is_rom(const char *filename)
 //     return found;
 // }
 
-static void log_roms_in_directory(const char *directory)
-{
-    if ((directory == NULL) || !sd_filesystem_ready) {
-        return;
-    }
+// static void log_roms_in_directory(const char *directory)
+// {
+//     if ((directory == NULL) || !sd_filesystem_ready) {
+//         return;
+//     }
 
-    DIR dir;
-    FILINFO info;
-    memset(&info, 0, sizeof(info));
-    FRESULT fr = f_opendir(&dir, directory);
-    if (fr != FR_OK) {
-        printf("ROM scan: unable to open %s (%d: %s)\n", directory, fr, FRESULT_str(fr));
-        return;
-    }
+//     DIR dir;
+//     FILINFO info;
+//     memset(&info, 0, sizeof(info));
+//     FRESULT fr = f_opendir(&dir, directory);
+//     if (fr != FR_OK) {
+//         printf("ROM scan: unable to open %s (%d: %s)\n", directory, fr, FRESULT_str(fr));
+//         return;
+//     }
 
-    printf("ROM scan: %s\n", directory);
-    bool any = false;
+//     printf("ROM scan: %s\n", directory);
+//     bool any = false;
 
-    while (true) {
-        fr = f_readdir(&dir, &info);
-        if (fr != FR_OK) {
-            printf("  readdir failed (%d: %s)\n", fr, FRESULT_str(fr));
-            break;
-        }
-        if (info.fname[0] == '\0') {
-            break;
-        }
-        if (info.fattrib & AM_DIR) {
-            continue;
-        }
+//     while (true) {
+//         fr = f_readdir(&dir, &info);
+//         if (fr != FR_OK) {
+//             printf("  readdir failed (%d: %s)\n", fr, FRESULT_str(fr));
+//             break;
+//         }
+//         if (info.fname[0] == '\0') {
+//             break;
+//         }
+//         if (info.fattrib & AM_DIR) {
+//             continue;
+//         }
 
-        const char *name = (const char *)info.fname;
-#if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
-        if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
-            name = (const char *)info.altname;
-        }
-#endif
-        if ((name == NULL) || !filename_is_rom(name)) {
-            continue;
-        }
+//         const char *name = (const char *)info.fname;
+// #if defined(FF_USE_LFN) && (FF_USE_LFN != 0)
+//         if ((name == NULL || name[0] == '\0') && info.altname[0] != '\0') {
+//             name = (const char *)info.altname;
+//         }
+// #endif
+//         if ((name == NULL) || !filename_is_rom(name)) {
+//             continue;
+//         }
 
-        any = true;
-        printf("  %s\n", name);
-    }
+//         any = true;
+//         printf("  %s\n", name);
+//     }
 
-    if (!any) {
-        printf("  <no ROMs>\n");
-    }
+//     if (!any) {
+//         printf("  <no ROMs>\n");
+//     }
 
-    FRESULT close_result = f_closedir(&dir);
-    if (close_result != FR_OK) {
-        printf("  close failed (%d: %s)\n", close_result, FRESULT_str(close_result));
-    }
-}
+//     FRESULT close_result = f_closedir(&dir);
+//     if (close_result != FR_OK) {
+//         printf("  close failed (%d: %s)\n", close_result, FRESULT_str(close_result));
+//     }
+// }
 
 // static void dump_sd_rom_inventory(void)
 // {
@@ -791,8 +809,23 @@ static const glyph_5x7_t menu_font[] = {
     GLYPH('=', 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00),
     GLYPH('/', 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00),
     GLYPH('(', 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
-    GLYPH(')', 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08)
+    GLYPH(')', 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08),
+    GLYPH(',', 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x04, 0x08),
+    GLYPH('[', 0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E),
+    GLYPH(']', 0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E),
+    GLYPH('!', 0x04, 0x04, 0x04, 0x04, 0x00, 0x00, 0x04)
 };
+
+/*
+
+00000000
+00000000
+00000000
+00001100
+00001100
+00000100
+00001000
+*/
 
 static const glyph_5x7_t *lookup_glyph(char c)
 {
@@ -890,8 +923,9 @@ static void format_rom_label(const char *path, char *out, size_t out_len)
     for (size_t i = 0; scratch[i] != '\0' && o < (out_len - 1) && o < (MENU_MAX_LABEL_CHARS - 1); ++i) {
         char c = (char)toupper((unsigned char)scratch[i]);
         bool allowed = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                c == ' ' || c == '-' || c == '_' || c == '.' || c == '/' ||
-                c == '(' || c == ')' || c == '\'');
+            c == ' ' || c == '-' || c == '_' || c == '.' || c == '/' ||
+            c == '(' || c == ')' || c == '\'' || c == ',' || c == '!' ||
+            c == '[' || c == ']');
         if (!allowed) {
             c = ' ';
         }
@@ -939,88 +973,78 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
     }
 
     uint32_t index = 0;
-    button_state_t last_up = BUTTON_STATE_UNPRESSED;
-    button_state_t last_down = BUTTON_STATE_UNPRESSED;
-    button_state_t last_left = BUTTON_STATE_UNPRESSED;
-    button_state_t last_right = BUTTON_STATE_UNPRESSED;
-    button_state_t last_a = BUTTON_STATE_UNPRESSED;
-    button_state_t last_start = BUTTON_STATE_UNPRESSED;
-    button_state_t last_home = BUTTON_STATE_UNPRESSED;
     // absolute_time_t auto_select_deadline = make_timeout_time_ms(4000);
     render_rom_menu(index);
 
     while (true) {
         nes_classic_controller();
-        handle_palette_hotkeys();
 
-        const button_state_t up = button_states[BUTTON_UP];
-        const button_state_t down = button_states[BUTTON_DOWN];
-        const button_state_t left = button_states[BUTTON_LEFT];
-        const button_state_t right = button_states[BUTTON_RIGHT];
-        const button_state_t a = button_states[BUTTON_A];
-        const button_state_t start = button_states[BUTTON_START];
-        const button_state_t home = button_states[BUTTON_HOME];
-
-        bool moved = false;
-        if ((up == BUTTON_STATE_PRESSED) && (last_up == BUTTON_STATE_UNPRESSED)) {
-            index = (index == 0) ? (sd_rom_list_count - 1) : (index - 1);
-            moved = true;
-        }
-        if ((down == BUTTON_STATE_PRESSED) && (last_down == BUTTON_STATE_UNPRESSED)) {
-            index = (index + 1u) % sd_rom_list_count;
-            moved = true;
-        }
-        if ((left == BUTTON_STATE_PRESSED) && (last_left == BUTTON_STATE_UNPRESSED)) {
-            uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
-            uint32_t page = index / visible_rows;
-            if (page == 0) {
-                // wrap to last page
+        // If a hotkey command happened, don't check buttons here
+        if (!command_check())
+        {
+            bool moved = false;
+            if (button_was_released(BUTTON_UP)) {
+                index = (index == 0) ? (sd_rom_list_count - 1) : (index - 1);
+                moved = true;
+            }
+            if (button_was_released(BUTTON_DOWN)) {
+                index = (index + 1u) % sd_rom_list_count;
+                moved = true;
+            }
+            if (button_was_released(BUTTON_LEFT)) {
+                uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
+                uint32_t page = index / visible_rows;
+                if (page == 0) {
+                    // wrap to last page
+                    uint32_t last_page = (sd_rom_list_count - 1) / visible_rows;
+                    index = last_page * visible_rows;
+                } else {
+                    index = (page - 1) * visible_rows;
+                }
+                if (index >= sd_rom_list_count) {
+                    index = sd_rom_list_count - 1;
+                }
+                moved = true;
+            }
+            if (button_was_released(BUTTON_RIGHT)) {
+                uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
+                uint32_t page = index / visible_rows;
                 uint32_t last_page = (sd_rom_list_count - 1) / visible_rows;
-                index = last_page * visible_rows;
-            } else {
-                index = (page - 1) * visible_rows;
+                if (page >= last_page) {
+                    index = 0;
+                } else {
+                    index = (page + 1) * visible_rows;
+                }
+                if (index >= sd_rom_list_count) {
+                    index = sd_rom_list_count - 1;
+                }
+                moved = true;
             }
-            if (index >= sd_rom_list_count) {
-                index = sd_rom_list_count - 1;
+            if (moved) {
+                render_rom_menu(index);
+                // auto_select_deadline = make_timeout_time_ms(4000);
             }
-            moved = true;
-        }
-        if ((right == BUTTON_STATE_PRESSED) && (last_right == BUTTON_STATE_UNPRESSED)) {
-            uint32_t visible_rows = (DMG_PIXELS_Y - 28) / MENU_LINE_HEIGHT;
-            uint32_t page = index / visible_rows;
-            uint32_t last_page = (sd_rom_list_count - 1) / visible_rows;
-            if (page >= last_page) {
-                index = 0;
-            } else {
-                index = (page + 1) * visible_rows;
+
+            bool confirm = false;
+            if (button_was_released(BUTTON_A)) {
+                confirm = true;
             }
-            if (index >= sd_rom_list_count) {
-                index = sd_rom_list_count - 1;
+            if (button_was_released(BUTTON_START)) {
+                confirm = true;
             }
-            moved = true;
-        }
-        if (moved) {
-            render_rom_menu(index);
-            // auto_select_deadline = make_timeout_time_ms(4000);
+            if (confirm) {
+                strncpy(selected_path, sd_rom_list[index], selected_len - 1);
+                selected_path[selected_len - 1] = '\0';
+                render_rom_menu(index);
+                return true;
+            }
+
+            if (button_was_released(BUTTON_HOME)) {
+                return false;
+            }
         }
 
-        bool confirm = false;
-        if ((a == BUTTON_STATE_PRESSED) && (last_a == BUTTON_STATE_UNPRESSED)) {
-            confirm = true;
-        }
-        if ((start == BUTTON_STATE_PRESSED) && (last_start == BUTTON_STATE_UNPRESSED)) {
-            confirm = true;
-        }
-        if (confirm) {
-            strncpy(selected_path, sd_rom_list[index], selected_len - 1);
-            selected_path[selected_len - 1] = '\0';
-            render_rom_menu(index);
-            return true;
-        }
-
-        if ((home == BUTTON_STATE_PRESSED) && (last_home == BUTTON_STATE_UNPRESSED)) {
-            return false;
-        }
+        button_state_save_previous();
         
         // if (time_reached(auto_select_deadline)) {
         //     strncpy(selected_path, sd_rom_list[index], selected_len - 1);
@@ -1028,14 +1052,6 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
         //     render_rom_menu(index);
         //     return true;
         // }
-
-        last_up = up;
-        last_down = down;
-        last_left = left;
-        last_right = right;
-        last_a = a;
-        last_start = start;
-        last_home = home;
 
         sleep_ms(40);
     }
@@ -1106,6 +1122,61 @@ static void log_free_heap(const char *tag)
 #else
     (void)tag;
 #endif
+}
+
+static bool ensure_audio_ready(void)
+{
+#if ENABLE_AUDIO
+    static uint32_t last_check_ms = 0;
+    static bool audio_started = false;
+    static bool deadline_initialized = false;
+    static absolute_time_t audio_guard_deadline;
+
+    if (audio_started) {
+        return true;
+    }
+
+    if (!deadline_initialized) {
+        audio_guard_deadline = delayed_by_ms(get_absolute_time(), 30000); // guard only first 10s
+        deadline_initialized = true;
+    }
+
+    // After the guard window, stop intervening to avoid runtime churn.
+    if (absolute_time_diff_us(get_absolute_time(), audio_guard_deadline) <= 0) {
+        audio_started = true;
+        return true;
+    }
+
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    // Check at most every 50 ms to avoid extra work in the hot path.
+    if ((last_check_ms == 0) || ((now_ms - last_check_ms) >= 50u)) {
+        const size_t low_watermark = AUDIO_BUFFER_SIZE / 10; // minimal guard against underrun
+        const size_t lock_watermark = AUDIO_BUFFER_SIZE / 3; // once above this, consider audio stable
+        size_t read_size = get_read_size(&dvi0.audio_ring, false);
+
+        if (read_size >= lock_watermark) {
+            audio_started = true;
+            return true;
+        }
+
+        if (read_size < low_watermark) {
+            // Only top up to smooth dips; avoid pointer resets that cause audible artifacts.
+            for (int i = 0; i < 8; ++i) {
+                pump_audio_samples();
+            }
+            read_size = get_read_size(&dvi0.audio_ring, false);
+            if (read_size >= lock_watermark) {
+                audio_started = true;
+                return true;
+            }
+        }
+
+        last_check_ms = now_ms;
+    }
+
+    return audio_started;
+#endif
+    return true;
 }
 
 static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot)
@@ -1659,37 +1730,6 @@ static void run_emulator_frame(void)
     } while (gb.gb_frame == 0);
 }
 
-static void handle_palette_hotkeys(void)
-{
-    static button_state_t last_left = BUTTON_STATE_UNPRESSED;
-    static button_state_t last_right = BUTTON_STATE_UNPRESSED;
-
-    if (button_states[BUTTON_SELECT] == BUTTON_STATE_PRESSED)
-    {
-        if ((button_states[BUTTON_LEFT] == BUTTON_STATE_UNPRESSED) && (last_left == BUTTON_STATE_PRESSED))
-        {
-            int index = get_scheme_index() - 1;
-            if (index < 0)
-            {
-                index = NUMBER_OF_SCHEMES - 1;
-            }
-            set_game_palette(index);
-        }
-
-        if ((button_states[BUTTON_RIGHT] == BUTTON_STATE_UNPRESSED) && (last_right == BUTTON_STATE_PRESSED))
-        {
-            int index = get_scheme_index() + 1;
-            if (index >= NUMBER_OF_SCHEMES)
-            {
-                index = 0;
-            }
-            set_game_palette(index);
-        }
-    }
-
-    last_left = button_states[BUTTON_LEFT];
-    last_right = button_states[BUTTON_RIGHT];
-}
 
 #if ENABLE_AUDIO
 static size_t audio_samples_for_frame(void)
@@ -1751,6 +1791,7 @@ int main(void)
     for (int i = 0; i < BUTTON_COUNT; i++)
     {
         button_states[i] = BUTTON_STATE_UNPRESSED;
+        button_states_previous[i] = BUTTON_STATE_UNPRESSED;
     }
  
     
@@ -1856,8 +1897,15 @@ int main(void)
     dvi_get_blank_settings(&dvi0)->bottom = 0;
     dvi_audio_sample_buffer_set(&dvi0, audio_buffer, AUDIO_BUFFER_SIZE);
     dvi_set_audio_freq(&dvi0, rate, cts, hdmi_n[offset]);
-    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE / 2);
-    printf("Audio buffer pre-filled to %d samples (50%%)\n", AUDIO_BUFFER_SIZE / 2);
+    // Prime audio ring fully with silence before starting DVI to avoid initial underflow.
+    set_read_offset(&dvi0.audio_ring, 0);
+    set_write_offset(&dvi0.audio_ring, 0);
+    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE);
+    for (int i = 0; i < 16; ++i) {
+        pump_audio_samples();
+    }
+    sleep_ms(10); // allow PLL/DMA to settle after warmup
+    printf("Audio buffer pre-filled to %d samples (100%%)\n", AUDIO_BUFFER_SIZE);
     boot_checkpoint("Audio pipeline ready");
 #endif
 
@@ -1899,19 +1947,21 @@ int main(void)
     printf("Peanut-GB initialized - entering main loop\n");
 
 #if ENABLE_AUDIO
-    // Reset and prime audio ring with a few frames to avoid startup underflow on some boots.
+    // One more prefill after ROM/emulator init so the ring is full when gameplay starts.
     set_read_offset(&dvi0.audio_ring, 0);
     set_write_offset(&dvi0.audio_ring, 0);
     memset(audio_buffer, 0, sizeof(audio_buffer));
-    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE / 2);
-    for (int i = 0; i < 4; ++i) {
+    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE); // prefill with silence
+    for (int i = 0; i < 16; ++i) {
         pump_audio_samples();
     }
+    sleep_ms(5);
 #endif
 
     absolute_time_t next_frame_time = make_timeout_time_us(DMG_FRAME_DURATION_US);
 
     uint32_t frame_counter = 0;
+    bool audio_guard_done = false;
 
     while (true)
     {
@@ -1941,9 +1991,13 @@ int main(void)
         }
     #if ENABLE_AUDIO
         pump_audio_samples();
+        if (!audio_guard_done) {
+            audio_guard_done = ensure_audio_ready();
+        }
     #endif
         swap_display_buffers();
-        handle_palette_hotkeys();
+        (void)command_check();
+        button_state_save_previous();
 
         sleep_until(next_frame_time);
         absolute_time_t now = get_absolute_time();
@@ -2047,19 +2101,19 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
         {
             if (i == 4)
             {
-                button_states[BUTTON_START] = (~i2c_buffer[i] & (1<<2)) > 0 ? 0 : 1;
-                button_states[BUTTON_SELECT] = (~i2c_buffer[i] & (1<<4)) > 0 ? 0 : 1;
-                button_states[BUTTON_DOWN] = (~i2c_buffer[i] & (1<<6)) > 0 ? 0 : 1;
-                button_states[BUTTON_RIGHT] = (~i2c_buffer[i] & (1<<7)) > 0 ? 0 : 1;
-
-                button_states[BUTTON_HOME] = (~i2c_buffer[i] & (1<<3)) > 0 ? 0 : 1;
+                button_states[BUTTON_START] = (~i2c_buffer[i] & (1<<2)) > 0 ? BUTTON_STATE_PRESSED : 1;
+                button_states[BUTTON_SELECT] = (~i2c_buffer[i] & (1<<4)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                button_states[BUTTON_DOWN] = (~i2c_buffer[i] & (1<<6)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                button_states[BUTTON_RIGHT] = (~i2c_buffer[i] & (1<<7)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                
+                button_states[BUTTON_HOME] = (~i2c_buffer[i] & (1<<3)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
             }
             else if (i == 5)
             {
-                button_states[BUTTON_UP] = (~i2c_buffer[i] & (1<<0)) > 0 ? 0 : 1;
-                button_states[BUTTON_LEFT] = (~i2c_buffer[i] & (1<<1)) > 0 ? 0 : 1;
-                button_states[BUTTON_A] = (~i2c_buffer[i] & (1<<4)) > 0 ? 0 : 1;
-                button_states[BUTTON_B] = (~i2c_buffer[i] & (1<<6)) > 0 ? 0 : 1;
+                button_states[BUTTON_UP] = (~i2c_buffer[i] & (1<<0)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                button_states[BUTTON_LEFT] = (~i2c_buffer[i] & (1<<1)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                button_states[BUTTON_A] = (~i2c_buffer[i] & (1<<4)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+                button_states[BUTTON_B] = (~i2c_buffer[i] & (1<<6)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
             }
         }
     }
@@ -2091,8 +2145,11 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 // Palette support for both 640x480 and 800x600 modes
 static void set_game_palette(int index)
 {
-    if ((index <0) || index >= NUMBER_OF_SCHEMES)
-        return;
+    if (index < 0)
+        index = NUMBER_OF_SCHEMES - 1;
+
+    if (index >= NUMBER_OF_SCHEMES)
+        index = 0;
 
     set_scheme_index(index);
     game_palette_rgb888 = (uint32_t*)get_scheme();
@@ -2109,4 +2166,73 @@ static void sd_stream_chunk_yield(void)
     pump_audio_samples();
 #endif
     tight_loop_contents();
+}
+
+static void reset_pico(void)
+{
+    printf("Resetting Pico...\n");
+    watchdog_reboot(0, 0, 0);
+    while (true) {
+        tight_loop_contents();
+    }
+}
+
+static bool button_is_pressed(controller_button_t button)
+{
+    return button_states[button] == BUTTON_STATE_PRESSED;
+}
+
+static bool button_was_released(controller_button_t button)
+{
+    return button_states[button] == BUTTON_STATE_UNPRESSED && button_states_previous[button] == BUTTON_STATE_PRESSED;
+}
+
+static bool command_check(void)
+{
+    // No change in states, just return false
+    if (memcmp(button_states, button_states_previous, sizeof(button_states)) == 0)
+        return false;
+
+    bool result = false;
+
+    if (button_was_released(BUTTON_HOME))
+    {
+        result = true;  // We don't return from this, but why not 
+        printf("Hotkey reset: HOME\n");
+        reset_pico();
+    }
+
+    if (button_is_pressed(BUTTON_SELECT))
+    {
+        // SELECT + START
+        if (button_was_released(BUTTON_START))
+        {
+            result = true;  // We don't return from this, but why not 
+            printf("Hotkey reset: SELECT+START\n");
+            reset_pico();
+        }
+
+        // SELECT + (LEFT OR RIGHT)
+        int scheme_index = get_scheme_index();
+        if (button_was_released(BUTTON_LEFT))
+        {
+            set_game_palette(--scheme_index);
+            result = true;
+        }
+        if (button_was_released(BUTTON_RIGHT))
+        {
+            set_game_palette(++scheme_index);
+            result = true;
+        }
+    }
+
+    return result;
+}
+
+static void button_state_save_previous(void)
+{
+    for (int i = 0; i < BUTTON_COUNT; i++) 
+    {
+        button_states_previous[i] = button_states[i];
+    }
 }
