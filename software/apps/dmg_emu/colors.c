@@ -1,13 +1,5 @@
 #include "colors.h"
 
-#define PIXEL_RSHIFT 5
-#define PIXEL_GSHIFT 2
-#define PIXEL_BSHIFT 0
-
-// I had the high bit/low bit reversed on some PCB revs
-static bool rgb_bits_reversed = false;
-
-// Store color schemes in flash to save RAM (608 bytes!)
 static const color_scheme_t color_schemes[NUMBER_OF_SCHEMES] = 
 {
     [SCHEME_BLACK_AND_WHITE] =  { 0xF7F3F7, 0x4E4C4E, 0xB5B2B5, 0x000000 },
@@ -49,59 +41,11 @@ static const color_scheme_t color_schemes[NUMBER_OF_SCHEMES] =
     [SCHEME_SGB_4H] =           { 0xF7F3C6, 0x848A42, 0xB5BA5A, 0x425129 }
 };
 
-static uint32_t basic_colors[NUMBER_OF_COLORS] = 
-{
-    [COLOR_BLACK]       = 0x000000,
-    [COLOR_BLUE]        = 0x0000FF,
-    [COLOR_WHITE]       = 0xFFFFFF,
-    [COLOR_DARK_GREY]   = 0x808080,
-    [COLOR_LIGHT_GREY]  = 0x404040,
-    [COLOR_RED]         = 0xFF0000,
-    [COLOR_GREEN]       = 0x00FF00,
-    [COLOR_YELLOW]      = 0xFFFF00,
-    [COLOR_PURPLE]      = 0xFF00FF
-};
-
-static int border_color_index = COLOR_BLACK;
 static int color_scheme_index = SCHEME_BLACK_AND_WHITE;
 
 //**********************************************************************************************
 // PUBLIC FUNCTIONS
 //**********************************************************************************************
-uint32_t get_basic_color(uint8_t index)
-{
-    return basic_colors[index];
-}
-
-uint32_t get_background_color(void)
-{
-    return basic_colors[border_color_index];
-}
-
-int get_border_color_index(void)
-{
-    return border_color_index;
-}
-
-void increase_border_color_index(int direction)
-{
-    set_border_color_index(border_color_index + direction);
-}
-
-void set_border_color_index(int index)
-{
-    uint8_t max = sizeof(basic_colors)/sizeof(uint32_t) -1;
-    border_color_index = index;
-    border_color_index = border_color_index < 0 ? max : border_color_index;
-    border_color_index = border_color_index > max ? 0 : border_color_index;
-}
-
-void increase_color_scheme_index(int direction)
-{
-    color_scheme_index += direction;    color_scheme_index = color_scheme_index >= NUMBER_OF_SCHEMES ? 0 : color_scheme_index;
-    color_scheme_index = color_scheme_index < 0 ? (NUMBER_OF_SCHEMES-1) : color_scheme_index;
-}
-
 const color_scheme_t* get_scheme(void)
 {
     return &color_schemes[color_scheme_index];
@@ -117,37 +61,4 @@ void set_scheme_index(int index)
     index = index >= NUMBER_OF_SCHEMES ? 0 : index;
     index = index < 0 ? (NUMBER_OF_SCHEMES-1) : index;
     color_scheme_index = index;
-}
-
-uint16_t rgb888_to_rgb222(uint32_t color)
-{
-        uint32_t ret = 0;
-        if (rgb_bits_reversed)
-        {
-            ret = ((color & (1<<6)) >> 5);          //b1
-            ret = ret | ((color & (1<<7)) >> 7);    //b0
-            ret = ret | ((color & (1<<14)) >> 11);  //g1
-            ret = ret | ((color & (1<<15)) >> 13);  //g0
-            ret = ret | ((color & (1<<22)) >> 17);  //r1
-            ret = ret | ((color & (1<<23)) >> 19);  //r0
-        }
-        else
-        {
-            uint32_t red = (color & 0xC00000) >> 22;
-            uint32_t green = (color & 0xC000) >> 14;
-            uint32_t blue = (color & 0xC0) >> 6;
-            ret = ( ( blue<<PIXEL_BSHIFT ) |( green<<PIXEL_GSHIFT ) |( red<<PIXEL_RSHIFT ) );
-        }
-            
-        return (uint16_t)ret;
-}
-
-void reverse_rgb_bits_toggle()
-{
-    rgb_bits_reversed = !rgb_bits_reversed;
-}
-
-bool rgb_bit_reverse_state(void)
-{
-    return rgb_bits_reversed;
 }

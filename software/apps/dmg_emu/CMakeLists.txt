@@ -6,6 +6,7 @@ add_executable(dmg_emu
     main.c
     colors.c
     audio/minigb_apu.c
+    eeprom.c
 )
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -41,6 +42,7 @@ target_link_libraries(dmg_emu
     hardware_uart
     hardware_irq
     hardware_dma
+    hardware_flash
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
 )
 

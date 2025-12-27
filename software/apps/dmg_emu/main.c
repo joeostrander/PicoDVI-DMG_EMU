@@ -43,12 +43,14 @@
 #include "tmds_encode.h"
 #include "audio_ring.h"  // For get_write_size and get_read_size
 
-#include "mario.h"
+#include "eeprom.h" // emulated with flash :)
+#include "hardware/flash.h"
+#include "flash_utils.h"
+#include "pico/bootrom.h"
 
 #include "colors.h"
 #include "hedley.h"
 #include "board_pins.h"
-// #include "hw_config.h"
 #include "sdcard.h"
 #include "ff.h"
 #include "f_util.h"
@@ -168,7 +170,24 @@ typedef struct
     uint32_t next_replace_slot;
 } sd_rom_stream_state_t;
 
+typedef enum
+{
+    SAVE_INDEX_SCHEME = 0,
+    SAVE_INDEX_FRAME_BLENDING
+} save_position_t;
 
+typedef enum
+{
+    DISABLE_MASK_NONE = 0,
+    DISABLE_MASK_MASS_STORAGE,
+    DISABLE_MASK_PICOBOOT
+} interface_disable_mask_t;
+
+typedef enum
+{
+    RESTART_NORMAL = 0,
+    RESTART_MASS_STORAGE,
+} restart_option_t;
 
 //********************************************************************************
 // PRIVATE FUNCTION PROTOTYPES
@@ -201,7 +220,6 @@ static bool build_sd_rom_list(void);
 // static void print_sd_rom_list(void);
 static bool sd_rom_selection_menu(char *selected_path, size_t selected_len);
 static void initialize_gpio(void);
-static void reset_pico(void);
 static bool button_is_pressed(controller_button_t button);
 static bool button_was_released(controller_button_t button);
 static bool command_check(void);
@@ -209,6 +227,11 @@ static void button_state_save_previous(void);
 static void reset_button_states(void);
 static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
 static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
+static void set_game_palette(int index);
+
+static void save_and_restart(void);
+static void reset_pico(restart_option_t restart_option);
+static void load_settings(void);
 
 //********************************************************************************
 // PRIVATE VARIABLES
@@ -264,8 +287,6 @@ static sd_rom_stream_state_t sd_rom_stream = {
     .bank_count = 0,
     .next_replace_slot = 0
 };
-
-
 
 static uint8_t button_states[BUTTON_COUNT];
 static uint8_t button_states_previous[BUTTON_COUNT];
@@ -335,7 +356,7 @@ const uint32_t palette__gbp_nso[4] = {
 
 const uint32_t* game_palette_rgb888 = palette__gbp_nso;
 
-static void set_game_palette(int index);
+
 
 #if RESOLUTION_800x600
 // For 2bpp packed mode with DVI_SYMBOLS_PER_WORD=2:
@@ -355,7 +376,11 @@ uint8_t line_buffer[DMG_PIXELS_X / 4] = {0};  // 40 bytes for 160 pixels packed
 
 #endif // RESOLUTION
 
+// static restart_option_t restart_option = RESTART_NORMAL;
 
+//********************************************************************************
+// PRIVATE FUNCTIONS
+//********************************************************************************
 static bool mount_sd_card(void)
 {
     printf("[SD] mount_sd_card entry\n");
@@ -1780,13 +1805,6 @@ int main(void)
     reset_button_states();
     
     stdio_init_all();
-    // uart_init(uart0, 115200);
-    // gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
-    // gpio_set_function(PICO_DEFAULT_UART_RX_PIN, GPIO_FUNC_UART);
-    
-    // sleep_ms(3000);  // Give USB more time to enumerate
-
-
 
     reset_active_rom_to_builtin();
     log_free_heap("after reset_active_rom_to_builtin");
@@ -1813,7 +1831,6 @@ int main(void)
     printf("[TRACE] entering display-prep stage\n");
 
     boot_checkpoint("Preparing display buffers (pre-copy)");
-    // Temporary: clear buffers instead of copying mario_packed_160x144
     memset(packed_buffer_0, 0xFF, PACKED_FRAME_SIZE);
     boot_checkpoint("Display buffer 0 clear complete");
     memset(packed_buffer_1, 0xFF, PACKED_FRAME_SIZE);
@@ -1853,7 +1870,7 @@ int main(void)
     boot_checkpoint("DVI configured");
     log_free_heap("after DVI init");
 
-    set_game_palette(SCHEME_SGB_4H);
+    load_settings();
 
     uint32_t *bufptr = (uint32_t *)line_buffer;
     queue_add_blocking_u32(&dvi0.q_colour_valid, &bufptr);
@@ -2182,12 +2199,6 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 // Palette support for both 640x480 and 800x600 modes
 static void set_game_palette(int index)
 {
-    if (index < 0)
-        index = NUMBER_OF_SCHEMES - 1;
-
-    if (index >= NUMBER_OF_SCHEMES)
-        index = 0;
-
     set_scheme_index(index);
     game_palette_rgb888 = (uint32_t*)get_scheme();
 
@@ -2203,15 +2214,6 @@ static void sd_stream_chunk_yield(void)
     pump_audio_samples();
 #endif
     tight_loop_contents();
-}
-
-static void reset_pico(void)
-{
-    printf("Resetting Pico...\n");
-    watchdog_reboot(0, 0, 0);
-    while (true) {
-        tight_loop_contents();
-    }
 }
 
 static bool button_is_pressed(controller_button_t button)
@@ -2240,23 +2242,23 @@ static bool command_check(void)
 
     if (button_is_pressed(BUTTON_SELECT))
     {
-        // SELECT + START
+        // SELECT + START - reset for new ROM selection
         if (button_was_released(BUTTON_START))
         {
             result = true;  // We don't return from this, but why not 
             printf("Hotkey reset: SELECT+START\n");
-            reset_pico();
+            reset_pico(RESTART_NORMAL);
         }
 
-        // SELECT + HOME
+        // SELECT + HOME - reset for new ROM selection
         if (button_was_released(BUTTON_HOME))
         {
             result = true;  // We don't return from this, but why not 
             printf("Hotkey reset: HOME\n");
-            reset_pico();
+            reset_pico(RESTART_NORMAL);
         }
 
-        // SELECT + (LEFT OR RIGHT)
+        // SELECT + (LEFT OR RIGHT) - change color scheme
         int scheme_index = get_scheme_index();
         if (button_was_released(BUTTON_LEFT))
         {
@@ -2266,6 +2268,13 @@ static bool command_check(void)
         if (button_was_released(BUTTON_RIGHT))
         {
             set_game_palette(++scheme_index);
+            result = true;
+        }
+
+        // SELECT + DOWN - save settings
+        if (button_was_released(BUTTON_DOWN))
+        {
+            save_and_restart();
             result = true;
         }
     }
@@ -2288,4 +2297,86 @@ static void reset_button_states(void)
         button_states[i] = BUTTON_STATE_UNPRESSED;
         button_states_previous[i] = BUTTON_STATE_UNPRESSED;
     }
+}
+
+
+static void save_and_restart(void)
+{
+    boot_checkpoint("Save begin");
+    bool saved = false;
+    eeprom_result_t result;
+    boot_checkpoint("Save write scheme");
+    result = EEPROM_write(SAVE_INDEX_SCHEME, get_scheme_index());
+    if (result == EEPROM_SUCCESS)
+    {
+        boot_checkpoint("Save commit begin");
+        result = EEPROM_commit();
+        if (result == EEPROM_SUCCESS)
+        {
+            printf("Saved scheme index to EEPROM: %d\n", get_scheme_index());
+            saved = true;
+            boot_checkpoint("Save commit ok");
+        }
+        else
+        {
+            printf("Failed to commit scheme index to EEPROM: %d\n", get_scheme_index());
+            boot_checkpoint("Save commit failed");
+        }
+    }
+    else
+    {
+        printf("Failed to save scheme index to EEPROM: %d\n", get_scheme_index());
+    }
+
+    boot_checkpoint(saved ? "Save success" : "Save failed");
+    
+    
+    // EEPROM_write(SAVE_INDEX_FRAME_BLENDING, frameblending_enabled ? 1 : 0);
+
+
+
+    // Restart device
+    // reset_pico(RESTART_NORMAL);
+}
+
+static void reset_pico(restart_option_t restart_option)
+{
+    if (restart_option == RESTART_NORMAL)
+    {
+        // Reset the Pico
+        printf("Resetting Pico...\n");
+        watchdog_reboot(0, 0, 0);
+    }
+    else
+    {
+        // Reset into USB boot mode
+        printf("Resetting Pico into USB boot mode...\n");
+        reset_usb_boot(0, DISABLE_MASK_NONE);
+    }
+
+    while (1)
+    {
+        tight_loop_contents();
+    }
+}
+
+
+static void load_settings(void)
+{
+    boot_checkpoint("Loading settings...\n");
+    uint8_t scheme = (uint8_t)SCHEME_SGB_4H;
+    if (EEPROM_read(SAVE_INDEX_SCHEME, &scheme) == EEPROM_SUCCESS)
+    {
+        printf("Loaded palette from EEPROM: %d\n", scheme);
+    }
+    else
+    {
+        printf("Failed to load palette from EEPROM, using default: %d\n", scheme);
+    }
+    set_game_palette((int)scheme);
+
+    boot_checkpoint("Settings loaded");
+
+    // set_scheme_index((int)EEPROM_read(SAVE_INDEX_SCHEME));
+    // frameblending_enabled = EEPROM_read(SAVE_INDEX_FRAME_BLENDING) == 1;
 }

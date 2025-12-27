@@ -65,6 +65,7 @@ On Windows you can substitute `-G "MinGW Makefiles"` or use the VS Code CMake ex
 - **SELECT + LEFT/RIGHT** cycles palette schemes.
 - **SELECT + START** exit game (restart Pico)
 - **SELECT + HOME** exit game (restart Pico)
+- **SELECT + DOWN** save settings
 
 ## Credits
 

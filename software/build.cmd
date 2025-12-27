@@ -39,3 +39,9 @@ if exist %DRIVE_LETTER%\ (
 ) else (
     echo %DRIVE_LETTER%\ drive not found, skipping copy
 )
+
+goto :eof
+
+:build_fail
+echo Build or copy failed.
+exit /b 1
