@@ -4,7 +4,6 @@
 
 add_executable(dmg_emu
     main.c
-    shared_dma_handler.c
     colors.c
     audio/minigb_apu.c
 )

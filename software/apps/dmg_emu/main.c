@@ -1,14 +1,3 @@
-/*
-
-TODO:
-
-    Get HDMI (DVI) working on real TV - works in 640x480
-    Possibly pull in some of the OSD features from PicoDVI-N64
-    cleanup unused headers
-    Add my version of OSD back in
-
-*/
-
 // Joe Ostrander
 // 2025.12.06
 // PicoDVI-DMG_EMU
@@ -76,13 +65,11 @@ TODO:
 
 #include "audio/minigb_apu.h"
 #include "peanut_gb.h"
-#include "roms/tetris_rom.h"
-// #include "roms/super_mario_land_rom.h"
+#include "roms/controller_test_rom.h"
 
 #define DMG_CLOCK_FREQ_INT        ((uint32_t)DMG_CLOCK_FREQ)
 #define SCREEN_REFRESH_CYCLES_INT ((uint32_t)SCREEN_REFRESH_CYCLES)
 #define MAX_AUDIO_SAMPLES_PER_FRAME ((uint32_t)(((uint64_t)AUDIO_SAMPLE_RATE * SCREEN_REFRESH_CYCLES_INT + DMG_CLOCK_FREQ_INT - 1) / DMG_CLOCK_FREQ_INT))
-
 
 #define ENABLE_AUDIO                1  // Enable Peanut-GB audio path
 #define ENABLE_OSD                  0  // Set to 1 to enable OSD code, 0 to disable (TODO)
@@ -105,6 +92,8 @@ TODO:
 #define MENU_COLOR_HL_FG            1u
 #define MENU_COLOR_TITLE            3u
 
+#define BIT_IS_CLEAR(value, bit)    (((value) & (1U << (bit))) == 0)
+
 
 #if ENABLE_AUDIO
 static const int hdmi_n[6] = {4096, 6272, 6144, 3136, 4096, 6144};  // 32k, 44.1k, 48k, 22.05k, 16k, 24k
@@ -117,7 +106,7 @@ static void pump_audio_samples(void);
 static void write_samples_to_ring(const audio_sample_t *samples, size_t sample_count);
 #endif
 
-#define DEBUG_BUTTON_PRESS   // Illuminate LED on button presses
+// #define DEBUG_BUTTON_PRESS
 
 #define ONBOARD_LED_PIN             25
 
@@ -217,6 +206,7 @@ static bool button_is_pressed(controller_button_t button);
 static bool button_was_released(controller_button_t button);
 static bool command_check(void);
 static void button_state_save_previous(void);
+static void reset_button_states(void);
 static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
 static void __no_inline_not_in_flash_func(core1_scanline_callback)(uint scanline);
 
@@ -1787,13 +1777,7 @@ int main(void)
     sleep_ms(10);
     set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
     log_free_heap("after clock init");
-
-    for (int i = 0; i < BUTTON_COUNT; i++)
-    {
-        button_states[i] = BUTTON_STATE_UNPRESSED;
-        button_states_previous[i] = BUTTON_STATE_UNPRESSED;
-    }
- 
+    reset_button_states();
     
     stdio_init_all();
     // uart_init(uart0, 115200);
@@ -2036,13 +2020,14 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 {
     static uint32_t last_micros = 0;
     static bool initialized = false;
-    static uint8_t i2c_buffer[16] = {0};
+    static uint8_t i2c_buffer[8] = {0};
     static absolute_time_t next_init_time = {0};
     static bool waiting_for_init = false;
     static uint32_t pending_init_delay_ms = NES_CONTROLLER_INIT_DELAY_MS;
+    static bool controller_armed = false; // don't report until we've seen a clean idle
 
     uint32_t current_micros = time_us_32();
-    if (current_micros - last_micros < 20000)   // probably longer than it needs to be, NES Classic queries about every 5ms
+    if (current_micros - last_micros < 5000)   // NES Classic queries about every 5ms
         return false;
 
     if (!initialized)
@@ -2062,6 +2047,7 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 
         waiting_for_init = false;
         pending_init_delay_ms = NES_CONTROLLER_REINIT_DELAY_MS;
+        controller_armed = false;
 
         i2c_buffer[0] = 0xF0;
         i2c_buffer[1] = 0x55;
@@ -2075,6 +2061,9 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 
         initialized = true;
         last_micros = time_us_32();
+
+        reset_button_states();
+
         return false;
     }
 
@@ -2083,7 +2072,14 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
     i2c_buffer[0] = 0x00;
     (void)i2c_write_blocking(i2cHandle, I2C_ADDRESS, i2c_buffer, 1, false);   // false - finished with bus
     sleep_us(300);  // NES Classic uses about 330uS
-    int ret = i2c_read_blocking(i2cHandle, I2C_ADDRESS, i2c_buffer, 8, false);
+
+    // Clear buffer to avoid stale bits if the device returns fewer bytes.
+    for (int j = 0; j < 8; ++j) {
+        i2c_buffer[j] = 0xFF;
+    }
+
+    // Get button data - only read 6 bytes
+    int ret = i2c_read_blocking(i2cHandle, I2C_ADDRESS, i2c_buffer, 6, false);
     if (ret < 0)
     {
         last_micros = time_us_32();
@@ -2092,30 +2088,55 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
         
     bool valid = false;
     uint8_t i;
-    for (i = 0; i < 8; i++)
+    // Validate the buffer - Check the first 4 bytes
+    for (i = 0; i < 4; i++)
     {
-        if ((i < 4) && (i2c_buffer[i] != 0xFF))
+        if (i2c_buffer[i] != 0xFF)
             valid = true;
+    }
 
-        if (valid)
-        {
-            if (i == 4)
-            {
-                button_states[BUTTON_START] = (~i2c_buffer[i] & (1<<2)) > 0 ? BUTTON_STATE_PRESSED : 1;
-                button_states[BUTTON_SELECT] = (~i2c_buffer[i] & (1<<4)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                button_states[BUTTON_DOWN] = (~i2c_buffer[i] & (1<<6)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                button_states[BUTTON_RIGHT] = (~i2c_buffer[i] & (1<<7)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                
-                button_states[BUTTON_HOME] = (~i2c_buffer[i] & (1<<3)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-            }
-            else if (i == 5)
-            {
-                button_states[BUTTON_UP] = (~i2c_buffer[i] & (1<<0)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                button_states[BUTTON_LEFT] = (~i2c_buffer[i] & (1<<1)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                button_states[BUTTON_A] = (~i2c_buffer[i] & (1<<4)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-                button_states[BUTTON_B] = (~i2c_buffer[i] & (1<<6)) > 0 ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
-            }
+    if (valid)
+    {
+        // Reject frames that are clearly bogus: all zeros on payload bytes.
+        const uint8_t b4 = i2c_buffer[4];
+        const uint8_t b5 = i2c_buffer[5];
+        if (b4 == 0x00 && b5 == 0x00) {
+            return false;
         }
+
+        button_states[BUTTON_START] = BIT_IS_CLEAR(b4, 2) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_SELECT] = BIT_IS_CLEAR(b4, 4) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_DOWN] = BIT_IS_CLEAR(b4, 6) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_RIGHT] = BIT_IS_CLEAR(b4, 7) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_HOME] = BIT_IS_CLEAR(b4, 3) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+
+        button_states[BUTTON_UP] = BIT_IS_CLEAR(b5, 0) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_LEFT] = BIT_IS_CLEAR(b5, 1) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_A] = BIT_IS_CLEAR(b5, 4) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+        button_states[BUTTON_B] = BIT_IS_CLEAR(b5, 6) ? BUTTON_STATE_PRESSED : BUTTON_STATE_UNPRESSED;
+
+#ifdef DEBUG_BUTTON_PRESS
+        static uint8_t button_states_debug[BUTTON_COUNT] = {0};
+        if (memcmp(button_states, button_states_debug, sizeof(button_states)) != 0)
+        {
+            memcpy(button_states_debug, button_states, sizeof(button_states));
+            printf("Button states:  ");
+            for (uint8_t i = 0; i < BUTTON_COUNT; i++)
+                printf("%d ", button_states_debug[i]);
+            printf("\n");
+        }
+#endif
+
+        //TESTING!!!
+        // // Prevent in-game reset lockup
+        // // If A,B,Select and Start are all pressed, release them!
+        // if ((button_states[BUTTON_A] | button_states[BUTTON_B] | button_states[BUTTON_SELECT]| button_states[BUTTON_START])==0)
+        // {
+        //     button_states[BUTTON_A] = BUTTON_STATE_UNPRESSED;
+        //     button_states[BUTTON_B] = BUTTON_STATE_UNPRESSED;
+        //     button_states[BUTTON_SELECT] = BUTTON_STATE_UNPRESSED;
+        //     button_states[BUTTON_START] = BUTTON_STATE_UNPRESSED;
+        // }
     }
 
     if (!valid )
@@ -2123,21 +2144,37 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
         initialized = false;
         waiting_for_init = false;
         pending_init_delay_ms = NES_CONTROLLER_REINIT_DELAY_MS;
+        controller_armed = false;
         last_micros = time_us_32();
         return false;
     }
 
-#ifdef DEBUG_BUTTON_PRESS
-    uint8_t buttondown = 0;
+    // Debounce/arm: require several consecutive idle frames before honoring input.
+    bool any_pressed = false;
     for (i = 0; i < BUTTON_COUNT; i++)
     {
         if (button_states[i] == BUTTON_STATE_PRESSED)
         {
-            buttondown = 1;
+            any_pressed = true;
+            break;
         }
     }
-    gpio_put(ONBOARD_LED_PIN, buttondown);
-#endif
+    gpio_put(ONBOARD_LED_PIN, any_pressed);
+
+
+    if (!controller_armed)
+    {
+        if (any_pressed)
+        {
+            reset_button_states();
+            printf("Waiting for clean button report (no presses)...\n");
+            return false;
+        }
+
+        controller_armed = true;
+        printf("Controller armed\n");
+    }
+
 
     return true;
 }
@@ -2193,14 +2230,13 @@ static bool command_check(void)
     if (memcmp(button_states, button_states_previous, sizeof(button_states)) == 0)
         return false;
 
+    // // Ignore any button presses for the first 5 seconds
+    // if (time_us_32() < 5000000)
+    //     return false;
+
     bool result = false;
 
-    if (button_was_released(BUTTON_HOME))
-    {
-        result = true;  // We don't return from this, but why not 
-        printf("Hotkey reset: HOME\n");
-        reset_pico();
-    }
+
 
     if (button_is_pressed(BUTTON_SELECT))
     {
@@ -2209,6 +2245,14 @@ static bool command_check(void)
         {
             result = true;  // We don't return from this, but why not 
             printf("Hotkey reset: SELECT+START\n");
+            reset_pico();
+        }
+
+        // SELECT + HOME
+        if (button_was_released(BUTTON_HOME))
+        {
+            result = true;  // We don't return from this, but why not 
+            printf("Hotkey reset: HOME\n");
             reset_pico();
         }
 
@@ -2234,5 +2278,14 @@ static void button_state_save_previous(void)
     for (int i = 0; i < BUTTON_COUNT; i++) 
     {
         button_states_previous[i] = button_states[i];
+    }
+}
+
+static void reset_button_states(void)
+{
+    for (int i = 0; i < BUTTON_COUNT; i++)
+    {
+        button_states[i] = BUTTON_STATE_UNPRESSED;
+        button_states_previous[i] = BUTTON_STATE_UNPRESSED;
     }
 }

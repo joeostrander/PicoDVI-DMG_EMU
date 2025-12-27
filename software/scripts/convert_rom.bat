@@ -5,5 +5,5 @@ if "%~1"=="" (
     exit /b 1
 )
 set "ROM=%~1"
-py software\scripts\gb_rom_to_header.py "%ROM%"
+py "%~dp0gb_rom_to_header.py" "%ROM%"
 endlocal

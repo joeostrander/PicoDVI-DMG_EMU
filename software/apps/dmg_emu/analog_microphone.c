@@ -12,7 +12,6 @@
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
-#include "shared_dma_handler.h"
 #include <stdio.h>
 #include "analog_microphone.h"
 
@@ -65,14 +64,6 @@ int analog_microphone_init(const struct analog_microphone_config* config) {
     // Store in global for shared handler
     audio_dma_chan = analog_mic.dma_channel;
     audio_dma_chan = analog_mic.dma_channel; // Export DMA channel for audio
-    if (!SHARED_DMA_RegisterCallback(audio_dma_chan, analog_dma_handler))
-    {
-        printf("ERROR: Failed to register DMA callback for channel %d\n", audio_dma_chan);
-        analog_microphone_deinit();
-        return -1;
-    }
-    printf("Registered DMA callback for channel: %d\n", audio_dma_chan);
-    
 
     float clk_div = (clock_get_hz(clk_adc) / (1.0 * config->sample_rate)) - 1;    dma_channel_config dma_channel_cfg = dma_channel_get_default_config(analog_mic.dma_channel);
 

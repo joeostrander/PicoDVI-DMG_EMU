@@ -1,3 +1,4 @@
+// Author: Joe Ostrander
 // Auto-generated from _controller_test.gb; size 32768 bytes
 #pragma once
 #include <stdint.h>
