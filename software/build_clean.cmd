@@ -8,9 +8,6 @@ cd %~dp0
 rmdir /s /q build 2>nul
 mkdir build
 cd build
-REM cmake -G "MinGW Makefiles" -DPICO_SDK_PATH=/path/to/sdk -DPICO_PLATFORM=rp2040 -DPICO_COPY_TO_RAM=1 ..
-REM cmake -G "MinGW Makefiles" -DPICO_SDK_PATH=/path/to/sdk -DPICO_PLATFORM=rp2350 -DPICO_COPY_TO_RAM=1 ..
-REM cmake --build . --target dmg_emu
 echo.
 echo ===== Running CMake Configuration =====
 cmake -G "MinGW Makefiles" -DPICO_COPY_TO_RAM=1 -DPICO_PLATFORM=%PLATFORM% -DPICO_BOARD=%BOARD% ..
@@ -23,6 +20,7 @@ if %errorlevel% neq 0 (
 echo.
 echo ===== Building Project =====
 cmd /c make -j4
+REM cmake --build . --target dmg_emu
 if %errorlevel% neq 0 (
     echo.
     echo *** BUILD FAILED ***

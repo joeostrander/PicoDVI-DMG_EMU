@@ -7,7 +7,10 @@ Game Boy emulation on the RP2350 with full HDMI video (via libdvi) and MiniGB AP
 ## Key Features
 
 - **Peanut-GB CPU/PPU** with MiniGB APU for accurate DMG simulation at 60 Hz.
-- **Direct HDMI output** at 640×480 or 800×600 (set `RESOLUTION_800x600` in `software/apps/dmg_emu/CMakeLists.txt`).
+- **Direct HDMI output** at 640×480 or 800×600
+  - set `RESOLUTION_800x600` in `software/apps/dmg_emu/CMakeLists.txt`
+  - 640x480 is stretched slightly horizontally, but is a valid HDMI resolution
+  - 800x600 is pixel accurate, but may only work on monitors or capture cards
 - **SD Card ROMs** - load/stream ROMs directly from SD Card
 - **Embedded ROM (optional)** powered by `software/scripts/gb_rom_to_header.py` (and the `convert_rom.bat` helper) so ROMs live in flash; no SD card or USB streaming required.
 - **HDMI audio** sourced from the emulated APU using libdvi’s audio ring, synced to 32 768 Hz with per-frame pacing.
