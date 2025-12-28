@@ -28,16 +28,18 @@
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 #include <stdio.h>
-#include "flash_utils.h"
 #include "pico/multicore.h"
 #include "pico/stdio.h"
 
-
-#define FLASH_ADDRESS_SECTOR        (PICO_FLASH_SIZE_BYTES-FLASH_SECTOR_SIZE)
-#define FLASH_ADDRESS_PAGE          (PICO_FLASH_SIZE_BYTES-FLASH_PAGE_SIZE)
 #define FLAG_VALID_EEPROM           (0xA5)
 
-const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_ADDRESS_PAGE);
+// Reserve the last flash sector for settings. 
+// PICO_FLASH_SIZE_BYTES should be set in CMakeLists.txt (0x200000 for 2MB)
+// otherwise it may default to 0x400000 (4MB) using the default linker script.
+#define FLASH_OFFSET_SECTOR  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define FLASH_OFFSET_PAGE    (FLASH_OFFSET_SECTOR + FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE) // last page in that sector
+const uint8_t *flash_target_contents = (const uint8_t *)(XIP_BASE + FLASH_OFFSET_PAGE);
+
 static uint8_t _data[FLASH_PAGE_SIZE] = {0};
 
 static bool _dirty = false;
@@ -136,20 +138,10 @@ eeprom_result_t __no_inline_not_in_flash_func(EEPROM_commit)(void)
     if (!_data)
         return EEPROM_FAILURE;
 
-    printf("[EEPROM] commit begin (dirty)\n");
-    // Protect flash operations from other core/IRQs to avoid lockups while XIP is paused.
-    printf("[EEPROM] lockout begin\\n");
     uint32_t ints = save_and_disable_interrupts();
-    // Avoid multicore lockout when core1 is parked; it can deadlock if the other core is halted.
-    // Flash ops already pause XIP, so IRQ masking is the critical guard here.
-    printf("[EEPROM] erase\\n");
-    flash_range_erase(FLASH_ADDRESS_SECTOR, FLASH_SECTOR_SIZE);
-    printf("[EEPROM] program\\n");
-    flash_range_program(FLASH_ADDRESS_PAGE, _data, FLASH_PAGE_SIZE);
-
+    flash_range_erase(FLASH_OFFSET_SECTOR, FLASH_SECTOR_SIZE);
+    flash_range_program(FLASH_OFFSET_PAGE, _data, FLASH_PAGE_SIZE);
     restore_interrupts(ints);
-
-    printf("[EEPROM] commit done\n");
 
     _dirty = false;
 

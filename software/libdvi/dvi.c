@@ -180,6 +180,7 @@ static inline void __dvi_func_x(_dvi_prepare_scanline_8bpp)(struct dvi_inst *ins
     queue_add_blocking_u32(&inst->q_tmds_valid, &tmdsbuf);
 }
 
+// JOE MODIFICATION START
 // 2bpp packed encoder for 800x600 resolution (SPW=2, 4× horizontal scaling + borders)
 // Input: packed 2bpp data (4 pixels per byte, 40 bytes = 160 pixels per scanline)
 // Output: 800 pixels (80 blank + 640 game + 80 blank)
@@ -216,6 +217,7 @@ static inline void __dvi_func_x(_dvi_prepare_scanline_2bpp_gameboy)(struct dvi_i
 
     queue_add_blocking_u32(&inst->q_tmds_valid, &tmdsbuf);
 }
+// JOE MODIFICATION END
 
 static inline void __dvi_func_x(_dvi_prepare_scanline_16bpp)(struct dvi_inst *inst, uint32_t *scanbuf) {
     uint32_t *tmdsbuf = NULL;
@@ -241,9 +243,11 @@ void __dvi_func(dvi_scanbuf_main_8bpp)(struct dvi_inst *inst) {
     __builtin_unreachable();
 }
 
+// JOE MODIFICATION START
 // 2bpp packed with RGB888 palette support
 void __dvi_func(dvi_scanbuf_main_2bpp_gameboy)(struct dvi_inst *inst) {
-    while (1) {
+    while (1) 
+    {
         const uint8_t *scanbuf = NULL;
         queue_remove_blocking_u32(&inst->q_colour_valid, (uint32_t*)&scanbuf);
         _dvi_prepare_scanline_2bpp_gameboy(inst, scanbuf);
@@ -251,6 +255,7 @@ void __dvi_func(dvi_scanbuf_main_2bpp_gameboy)(struct dvi_inst *inst) {
     }
     __builtin_unreachable();
 }
+// JOE MODIFICATION END
 
 // Ugh copy/paste but it lets us garbage collect the TMDS stuff that is not being used from .scratch_x
 void __dvi_func(dvi_scanbuf_main_16bpp)(struct dvi_inst *inst) {

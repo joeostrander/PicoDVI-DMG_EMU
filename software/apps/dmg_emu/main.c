@@ -45,7 +45,6 @@
 
 #include "eeprom.h" // emulated with flash :)
 #include "hardware/flash.h"
-#include "flash_utils.h"
 #include "pico/bootrom.h"
 
 #include "colors.h"
@@ -2299,44 +2298,30 @@ static void reset_button_states(void)
     }
 }
 
-
 static void save_and_restart(void)
 {
-    boot_checkpoint("Save begin");
-    bool saved = false;
     eeprom_result_t result;
-    boot_checkpoint("Save write scheme");
     result = EEPROM_write(SAVE_INDEX_SCHEME, get_scheme_index());
     if (result == EEPROM_SUCCESS)
     {
-        boot_checkpoint("Save commit begin");
+        // We have to disable DVI to safely commit EEPROM changes
+        dvi_serialiser_enable(&dvi0.ser_cfg, false);
         result = EEPROM_commit();
+        dvi_serialiser_enable(&dvi0.ser_cfg, true);
+
         if (result == EEPROM_SUCCESS)
         {
             printf("Saved scheme index to EEPROM: %d\n", get_scheme_index());
-            saved = true;
-            boot_checkpoint("Save commit ok");
         }
         else
         {
             printf("Failed to commit scheme index to EEPROM: %d\n", get_scheme_index());
-            boot_checkpoint("Save commit failed");
         }
     }
     else
     {
         printf("Failed to save scheme index to EEPROM: %d\n", get_scheme_index());
     }
-
-    boot_checkpoint(saved ? "Save success" : "Save failed");
-    
-    
-    // EEPROM_write(SAVE_INDEX_FRAME_BLENDING, frameblending_enabled ? 1 : 0);
-
-
-
-    // Restart device
-    // reset_pico(RESTART_NORMAL);
 }
 
 static void reset_pico(restart_option_t restart_option)

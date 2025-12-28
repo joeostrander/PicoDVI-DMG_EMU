@@ -29,6 +29,7 @@ target_compile_definitions(dmg_emu PRIVATE
     DVI_SYMBOLS_PER_WORD=2
     RESOLUTION_800x600=${RESOLUTION_800x600}
     PICO_USE_MALLOC_PANIC=0
+    PICO_FLASH_SIZE_BYTES=0x200000  # (2097152, 2MB) - I need to define this or it may set to 4MB by default
 )
 
 target_link_libraries(dmg_emu
@@ -75,11 +76,6 @@ pico_enable_stdio_usb(dmg_emu 0)
 # set(PICO_STDIO_DEFAULT_CRLF 1)  # Optional: convert \n to \r\n
 
 target_include_directories(dmg_emu PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-
-# Build pio programs
-# pico_generate_pio_header(dmg_emu ${CMAKE_CURRENT_LIST_DIR}/video_capture.pio)
-# pico_generate_pio_header(dmg_emu ${CMAKE_CURRENT_LIST_DIR}/dmg_emu_buttons.pio)
-
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(dmg_emu)
