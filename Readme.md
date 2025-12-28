@@ -1,6 +1,9 @@
 # PicoDVI-DMG_EMU
 
-Game Boy emulation on the RP2350 with full HDMI video (via libdvi) and MiniGB APU audio. The original PicoDVI DMG capture pipeline has been replaced with an embedded Peanut-GB core, so the RP2350 now runs the entire emulator, renders frames directly into the TMDS encoder, and streams stereo audio over HDMI.
+Original PicoDVI DMG capture project:
+https://github.com/joeostrander/PicoDVI-DMG
+
+This version removes the need for an actual Game Boy DMG and uses emulation on the RP2350 with full HDMI video (via libdvi) and MiniGB APU audio. The original PicoDVI DMG capture pipeline has been replaced with an embedded Peanut-GB core, so the RP2350 now runs the entire emulator, renders frames directly into the TMDS encoder, and streams stereo audio over HDMI.
 
 ![gameplay preview](./images/gameplay.gif?raw=true)
 
