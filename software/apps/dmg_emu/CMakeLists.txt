@@ -34,6 +34,7 @@ target_compile_definitions(dmg_emu PRIVATE
 
 target_link_libraries(dmg_emu
     pico_stdlib
+    pico_stdio_uart
     pico_multicore
     pico_util
     libdvi

@@ -3,11 +3,12 @@
 // PicoDVI-DMG_EMU
 //
 
+// Using custom pins to stay consistent with PicoDVI-DMG project (which uses pins 0/1 for video capture)
 // Keep these defines at the top before including pico headers
 #define PICO_DEFAULT_UART_BAUD_RATE 115200
-#define PICO_DEFAULT_UART_TX_PIN    0
-#define PICO_DEFAULT_UART_RX_PIN    1
-#define PICO_DEFAULT_UART 0
+#define PICO_DEFAULT_UART_TX_PIN    20
+#define PICO_DEFAULT_UART_RX_PIN    21
+#define PICO_DEFAULT_UART 1
 // #define PICO_STDIO_DEFAULT_CRLF 1
 
 // REMINDER: Always use cmake with:  -DPICO_COPY_TO_RAM=1
@@ -1803,7 +1804,13 @@ int main(void)
     log_free_heap("after clock init");
     reset_button_states();
     
-    stdio_init_all();
+    // Initialize stdio for serial debugging
+    uart_init(uart1, PICO_DEFAULT_UART_BAUD_RATE);
+    gpio_set_function(PICO_DEFAULT_UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(PICO_DEFAULT_UART_RX_PIN, GPIO_FUNC_UART);
+    // stdio_init_all();
+    stdio_uart_init_full(uart1, PICO_DEFAULT_UART_BAUD_RATE, PICO_DEFAULT_UART_TX_PIN, PICO_DEFAULT_UART_RX_PIN);  // TX=20, RX=21
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     reset_active_rom_to_builtin();
     log_free_heap("after reset_active_rom_to_builtin");
