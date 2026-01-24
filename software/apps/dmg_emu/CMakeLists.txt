@@ -7,6 +7,8 @@ add_executable(dmg_emu
     colors.c
     audio/minigb_apu.c
     eeprom.c
+    osd.c
+    font_5x7.c
 )
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
