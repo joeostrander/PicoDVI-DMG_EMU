@@ -1,5 +1,5 @@
-#include "font_5x7.h"
 #include "osd.h"
+#include "font_5x7.h"
 #include "video_defs.h"
 #include <string.h>
 #include <stdint.h>

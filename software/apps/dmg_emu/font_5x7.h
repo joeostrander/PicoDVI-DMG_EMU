@@ -4,8 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
-
 typedef struct {
     char ch;
     uint8_t rows[7];

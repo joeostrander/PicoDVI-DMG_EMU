@@ -142,6 +142,7 @@ typedef enum
     OSD_LINE_COLOR_SCHEME = 0,
     // OSD_LINE_BORDER_COLOR,
     OSD_LINE_FRAME_BLENDING,
+    OSD_LINE_AUDIO_RESET,
     // OSD_LINE_RESET_GAMEBOY,
     OSD_LINE_RESET_DEVICE,
     OSD_LINE_SAVE_SETTINGS,
@@ -391,6 +392,7 @@ static void save_settings(void);
 static void reset_pico(restart_option_t restart_option);
 static void load_settings(void);
 static void update_osd(void);
+static void restart_audio_pipeline(void);
 
 
 #if ENABLE_AUDIO
@@ -700,7 +702,7 @@ static bool filename_is_rom(const char *filename)
 //         "0:/"
 //     };
 
-//     for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+//     for (size_t i = 0; i < sizeof(search_paths)/sizeof(search_paths[0]); ++i) {
 //         log_roms_in_directory(search_paths[i]);
 //     }
 // }
@@ -802,7 +804,8 @@ static bool build_sd_rom_list(void)
         "0:/"
     };
 
-    for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+    for (size_t i = 0; i < sizeof(search_paths)/sizeof(search_paths[0]); ++i) 
+    {
         scan_directory_for_roms(search_paths[i]);
         if (sd_rom_list_count >= MAX_SD_ROM_LIST) {
             break;
@@ -1216,6 +1219,22 @@ static bool ensure_audio_ready(void)
     return true;
 }
 
+static void restart_audio_pipeline(void)
+{
+#if ENABLE_AUDIO
+    printf("[AUDIO] restart requested: resetting ring and refilling.\n");
+    audio_sample_residual = 0;
+    set_read_offset(&dvi0.audio_ring, 0);
+    set_write_offset(&dvi0.audio_ring, 0);
+    memset(audio_buffer, 0, sizeof(audio_buffer));
+    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE);
+    for (int i = 0; i < 16; ++i) {
+        pump_audio_samples();
+    }
+    sleep_ms(2);
+#endif
+}
+
 static bool sd_stream_load_bank(uint32_t bank_index, sd_rom_cache_slot_t *slot)
 {
     if (!sd_rom_stream.open) {
@@ -1337,7 +1356,7 @@ static uint8_t sd_stream_read_byte(size_t addr)
 //         "0:/"
 //     };
 
-//     for (size_t i = 0; i < ARRAY_SIZE(search_paths); ++i) {
+//     for (size_t i = 0; i < sizeof(search_paths)/sizeof(search_paths[0]); ++i) {
 //         if (find_first_rom_in_directory(search_paths[i], sd_rom_path, sizeof(sd_rom_path))) {
 //             printf("Found SD ROM: %s\n", sd_rom_path);
 //             sd_rom_discovered = true;
@@ -2047,6 +2066,11 @@ static bool command_check(void)
 
                             update_osd();
                             break;
+                        case OSD_LINE_AUDIO_RESET:
+                            if (button == BUTTON_A) {
+                                restart_audio_pipeline();
+                            }
+                            break;
                         // case OSD_LINE_RESET_GAMEBOY:
                         //     gameboy_reset();
                         //     break;
@@ -2181,6 +2205,8 @@ static void update_osd(void)
 
     sprintf(buff, "FRAME BLEND:%9s", frame_blending_enabled ? "ON" : "OFF");
     OSD_set_line_text(OSD_LINE_FRAME_BLENDING, buff);
+
+    OSD_set_line_text(OSD_LINE_AUDIO_RESET, "AUDIO RESET");
     
     sprintf(buff, "RESET DEVICE:%8s", restart_option == RESTART_MASS_STORAGE ? "USB" : "NORM");
     OSD_set_line_text(OSD_LINE_RESET_DEVICE, buff);
