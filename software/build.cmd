@@ -1,6 +1,6 @@
 @echo off
 
-SET DRIVE_LETTER=E:
+SET DRIVE_LETTER=D:
 
 cd %~dp0
 del build\apps\dmg_emu\CMakeFiles\dmg_emu.dir\main.c.obj

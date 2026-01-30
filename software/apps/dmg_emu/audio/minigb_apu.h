@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #ifndef AUDIO_SAMPLE_RATE
-#define AUDIO_SAMPLE_RATE  32768
+#define AUDIO_SAMPLE_RATE  32000
 #endif
 
 #define DMG_CLOCK_FREQ     4194304.0
