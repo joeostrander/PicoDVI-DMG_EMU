@@ -80,6 +80,9 @@
 
 #define ENABLE_AUDIO                1  // Enable Peanut-GB audio path
 #define ENABLE_OSD                  1  // Set to 1 to enable OSD code, 0 to disable
+#ifndef ENABLE_SD_CARD
+#define ENABLE_SD_CARD              1  // Set to 0 to skip SD init/menu and use built-in ROM only
+#endif
 #define ENABLE_SD_STATS_LOG         0  // Set to 1 to print periodic SD cache hit/miss stats
 #define ENABLE_HEAP_LOG             0  // Set to 1 to print free-heap checkpoints
 
@@ -349,6 +352,7 @@ static void reset_pico(restart_option_t restart_option);
 static void load_settings(void);
 static void update_osd(void);
 static void restart_audio_pipeline(void);
+static void reset_audio_ring_prefill(size_t fill_samples);
 
 
 #if ENABLE_AUDIO
@@ -1307,15 +1311,31 @@ static bool ensure_audio_ready(void)
     return true;
 }
 
+static void reset_audio_ring_prefill(size_t fill_samples)
+{
+#if ENABLE_AUDIO
+    const size_t max_fill = AUDIO_BUFFER_SIZE - 1; // leave one slot empty for ring logic
+    size_t target_fill = (fill_samples > max_fill) ? max_fill : fill_samples;
+
+    audio_sample_residual = 0;
+    memset(audio_buffer, 0, sizeof(audio_buffer));
+    set_read_offset(&dvi0.audio_ring, 0);
+    set_write_offset(&dvi0.audio_ring, 0);
+    set_write_offset(&dvi0.audio_ring, (uint32_t)target_fill);
+
+    dvi0.audio_sample_pos = 0;
+    dvi0.left_audio_sample_count = 0;
+    dvi0.audio_frame_count = 0;
+#else
+    (void)fill_samples;
+#endif
+}
+
 static void restart_audio_pipeline(void)
 {
 #if ENABLE_AUDIO
     printf("[AUDIO] restart requested: resetting ring and refilling.\n");
-    audio_sample_residual = 0;
-    set_read_offset(&dvi0.audio_ring, 0);
-    set_write_offset(&dvi0.audio_ring, 0);
-    memset(audio_buffer, 0, sizeof(audio_buffer));
-    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE);
+    reset_audio_ring_prefill(AUDIO_BUFFER_SIZE - 8);
     for (int i = 0; i < 16; ++i) {
         pump_audio_samples();
     }
@@ -2373,12 +2393,14 @@ int main(void)
     packed_render_ptr = packed_buffer_1;
     boot_checkpoint("Display buffers primed");
 
+    bool rom_list_ready = false;
+
+#if ENABLE_SD_CARD
     boot_checkpoint("Calling mount_sd_card");
     bool sd_mount_ok = mount_sd_card();
     boot_checkpoint("mount_sd_card returned");
     log_free_heap("after mount_sd_card");
 
-    bool rom_list_ready = false;
     if (!sd_mount_ok) {
         printf("Continuing with built-in ROM image (SD unavailable).\n");
     } else {
@@ -2396,6 +2418,11 @@ int main(void)
         }
     }
     boot_checkpoint("SD stage complete");
+#else
+    printf("SD card disabled at build time; using built-in ROM image.\n");
+    reset_active_rom_to_builtin();
+    boot_checkpoint("SD stage skipped (disabled)");
+#endif
 
     // Initialize OSD overlays (disabled by default)
     OSD_init(DMG_PIXELS_X, DMG_PIXELS_Y);
@@ -2431,8 +2458,7 @@ int main(void)
     } else {
         offset = 0;
     }
-    memset(audio_buffer, 0, sizeof(audio_buffer));
-    int cts = dvi0.timing->bit_clk_khz * hdmi_n[offset] / (rate / 100) / 128;
+    int cts = dvi0.timing->bit_clk_khz * hdmi_n[offset] / (rate / 100) / 128; // ORIGINAL
     dvi_get_blank_settings(&dvi0)->top = 0;
     dvi_get_blank_settings(&dvi0)->bottom = 0;
     dvi_audio_sample_buffer_set(&dvi0, audio_buffer, AUDIO_BUFFER_SIZE);
@@ -2441,11 +2467,13 @@ int main(void)
     set_read_offset(&dvi0.audio_ring, 0);
     set_write_offset(&dvi0.audio_ring, 0);
     increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE);
+    reset_audio_ring_prefill(AUDIO_BUFFER_SIZE - 8);
     for (int i = 0; i < 16; ++i) {
         pump_audio_samples();
     }
     sleep_ms(10); // allow PLL/DMA to settle after warmup
-    printf("Audio buffer pre-filled to %d samples (100%%)\n", AUDIO_BUFFER_SIZE);
+    size_t prefill = get_read_size(&dvi0.audio_ring, false);
+    printf("Audio buffer pre-filled to %lu samples\n", (unsigned long)prefill);
     boot_checkpoint("Audio pipeline ready");
 #endif
 
@@ -2488,11 +2516,8 @@ int main(void)
 
 #if ENABLE_AUDIO
     // One more prefill after ROM/emulator init so the ring is full when gameplay starts.
-    set_read_offset(&dvi0.audio_ring, 0);
-    set_write_offset(&dvi0.audio_ring, 0);
-    memset(audio_buffer, 0, sizeof(audio_buffer));
-    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE); // prefill with silence
-    for (int i = 0; i < 16; ++i) {
+    reset_audio_ring_prefill(AUDIO_BUFFER_SIZE - 8);
+    for (int i = 0; i < 12; ++i) {
         pump_audio_samples();
     }
     sleep_ms(5);

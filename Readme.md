@@ -7,17 +7,24 @@ This version removes the need for an actual Game Boy DMG and uses emulation on t
 
 ![gameplay preview](./images/gameplay.gif?raw=true)
 
+![pcb](./images/pcb_v1.png?raw=true)
+
+![osd](./images/osd.jpg?raw=true) 
+
 ## Key Features
 
 - **Peanut-GB CPU/PPU** with MiniGB APU for accurate DMG simulation at 60 Hz.
 - **Direct HDMI output** at 640×480 or 800×600
-  - set `RESOLUTION_800x600` in `software/apps/dmg_emu/CMakeLists.txt`
-  - 640x480 is stretched slightly horizontally, but is a valid HDMI resolution
-  - 800x600 is pixel accurate, but may only work on monitors or capture cards
+	- Set resolution via cmake parameter:  -DRESOLUTION_MODE=2  
+  - Modes:  
+	- 0: 640x480, horizontally scaled x4, vertically x3 --> 640x480 Full screen  
+	- 1: 800x600, horizontally scaled x4, vertically x4 --> 640x576 window
+	- 2: 640x480, horizontally scaled x2, vertically x2 --> 320x288 window
+	- Note: TVs might not support 800x600
 - **SD Card ROMs** - load/stream ROMs directly from SD Card
 - **Embedded ROM (optional)** powered by `software/scripts/gb_rom_to_header.py` (and the `convert_rom.bat` helper) so ROMs live in flash; no SD card or USB streaming required.
-- **HDMI audio** sourced from the emulated APU using libdvi’s audio ring, synced to 32 768 Hz with per-frame pacing.
-- **Palette selection** with `SELECT + LEFT/RIGHT` and optional color schemes (`colors.c`).
+- **HDMI audio** sourced from the emulated APU using libdvi’s audio ring, synced to 32KHz with per-frame pacing.
+- **On-Screen Display** - change color schemes, toggle frame blending, etc.
 - **NES Classic controller input** over I²C with non-blocking startup/retry handling.
 
 ## Converting ROMs
