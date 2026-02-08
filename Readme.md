@@ -5,6 +5,7 @@ Play Gameboy DMG games with audio over HDMI with a Raspbery Pi Pico 2 (rp2350).
 **Updates**:  
 - 2026.02.08 
   - added support for the Adafruit Metro RP2350 + HSTX to DVI Adapter.  (set USE_METRO_RP2350 = 1 in board_defs.h)
+	- added support for original NES controller
 
 
 
@@ -15,7 +16,9 @@ https://github.com/joeostrander/PicoDVI-DMG
 ![gameplay preview](./images/gameplay.gif?raw=true)
 
 Using Adafruit Metro RP2350:  
-![pcb](./images/metro_rp2350.jpg?raw=true)
+![metro rp2350](./images/metro_rp2350.jpg?raw=true)  
+![metro rp2350 og controller](./images/metro_rp2350_with_nes_og_controller.jpg?raw=true)  
+
 
 Using my custom PCB: 
 ![pcb](./images/pcb_v1.png?raw=true)
@@ -37,6 +40,7 @@ Using my custom PCB:
 - **HDMI audio** sourced from the emulated APU using libdvi’s audio ring, synced to 32KHz with per-frame pacing.
 - **On-Screen Display** - change color schemes, toggle frame blending, etc.
 - **NES Classic controller input** over I²C with non-blocking startup/retry handling.
+- **NES Original controller input** shift-register-based polling  
 
 ## Converting ROMs
 

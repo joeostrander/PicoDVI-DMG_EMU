@@ -59,16 +59,19 @@
 #include "osd.h"
 #include "font_5x7.h"
 
-#define HOME_RESETS_TO_BOOTLOADER   0  // Set to 1 to enable HOME button to reset into USB mass storage mode for easier programming
+// Set to 1 to enable HOME button to reset into USB mass storage mode for easier programming
+#define HOME_RESETS_TO_BOOTLOADER       0  
 
-#define SAMPLE_FREQ                 32000
-#define AUDIO_BUFFER_SIZE           1024
-#define AUDIO_SAMPLE_RATE           SAMPLE_FREQ
-#define ENABLE_SOUND                1
-#define DMG_FRAME_DURATION_US       ((uint32_t)(1000000.0 / VERTICAL_SYNC + 0.5))
-#define FRAME_CATCHUP_THRESHOLD_US  (DMG_FRAME_DURATION_US * 64u)
-#define NES_CONTROLLER_INIT_DELAY_MS   2000u
-#define NES_CONTROLLER_REINIT_DELAY_MS 1000u
+#define SAMPLE_FREQ                     32000
+#define AUDIO_BUFFER_SIZE               1024
+#define AUDIO_SAMPLE_RATE               SAMPLE_FREQ
+#define ENABLE_SOUND                    1
+#define DMG_FRAME_DURATION_US           ((uint32_t)(1000000.0 / VERTICAL_SYNC + 0.5))
+#define FRAME_CATCHUP_THRESHOLD_US      (DMG_FRAME_DURATION_US * 64u)
+
+// For *NES Classic* I2C-based controller
+#define NES_CONTROLLER_INIT_DELAY_MS    2000u
+#define NES_CONTROLLER_REINIT_DELAY_MS  1000u
 
 #include "audio/minigb_apu.h"
 #include "peanut_gb.h"
@@ -334,7 +337,7 @@ static void swap_display_buffers(void);
 static bool init_peanut_emulator(void);
 static void run_emulator_frame(void);
 static void initialize_gpio(void);
-static bool __no_inline_not_in_flash_func(nes_classic_controller)(void);
+static bool __no_inline_not_in_flash_func(game_controller)(void);
 static void set_game_palette(int index);
 static void sd_stream_chunk_yield(void);
 static bool button_is_pressed(controller_button_t button);
@@ -1089,7 +1092,7 @@ static bool sd_rom_selection_menu(char *selected_path, size_t selected_len)
     render_rom_menu(index);
 
     while (true) {
-        nes_classic_controller();
+        game_controller();
 
         bool redraw = false;
         bool needs_render = false;
@@ -1856,11 +1859,12 @@ static void run_emulator_frame(void)
 
 static void initialize_gpio(void)
 {    
-    //Onboard LED
+    //Debug LED
     gpio_init(PIN_LED);
     gpio_set_dir(PIN_LED, GPIO_OUT);
     gpio_put(PIN_LED, 0);
-
+    
+#if USE_NES_CLASSIC_CONTROLLER
     //Initialize I2C port at 400 kHz
     i2c_init(i2cHandle, 400 * 1000);
 
@@ -1869,10 +1873,27 @@ static void initialize_gpio(void)
     gpio_set_function(PIN_SDA, GPIO_FUNC_I2C);
     gpio_pull_up(PIN_SCL);
     gpio_pull_up(PIN_SDA);
+#else
+    /* Clock, normally HIGH */
+    gpio_init(PIN_NES_PULSE);
+    gpio_set_dir(PIN_NES_PULSE, GPIO_OUT);
+    gpio_put(PIN_NES_PULSE, 1);
+
+    /* Latch, normally LOW */
+    gpio_init(PIN_NES_LATCH);
+    gpio_set_dir(PIN_NES_LATCH, GPIO_OUT);
+    gpio_put(PIN_NES_LATCH, 0);
+
+    /* Data, reads normally high */
+    gpio_init(PIN_NES_DATA);
+    gpio_set_dir(PIN_NES_DATA, GPIO_IN);
+    // Optionally add pullup
+    gpio_pull_up(PIN_NES_DATA);
+#endif 
 }
 
-// static bool nes_classic_controller(void)
-static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
+#if USE_NES_CLASSIC_CONTROLLER
+static bool __no_inline_not_in_flash_func(game_controller)(void)
 {
     static uint32_t last_micros = 0;
     static bool initialized = false;
@@ -2034,6 +2055,49 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
 
     return true;
 }
+#else
+// Using NES original controller!
+static bool __no_inline_not_in_flash_func(game_controller)(void)
+{
+    static uint32_t last_micros = 0;
+    uint32_t current_micros = time_us_32();
+    if (current_micros - last_micros < 20000)
+        return false;
+
+    last_micros = current_micros;
+
+    gpio_put(PIN_NES_LATCH, 1);
+    sleep_us(5);
+    gpio_put(PIN_NES_LATCH, 0);
+    sleep_us(1);
+    button_states[0] = gpio_get(PIN_NES_DATA) ? BUTTON_STATE_UNPRESSED : BUTTON_STATE_PRESSED;
+    sleep_us(4);
+
+    for (uint i = 1; i < 8; i++) 
+    {
+        sleep_us(8);
+        gpio_put(PIN_NES_PULSE, 0);
+        sleep_us(1);
+        gpio_put(PIN_NES_PULSE, 1);
+        sleep_us(8);
+        button_states[i] = gpio_get(PIN_NES_DATA) ? BUTTON_STATE_UNPRESSED : BUTTON_STATE_PRESSED;
+    }
+
+    // Debounce/arm: require several consecutive idle frames before honoring input.
+    bool any_pressed = false;
+    for (uint i = 0; i < BUTTON_COUNT; i++)
+    {
+        if (button_states[i] == BUTTON_STATE_PRESSED)
+        {
+            any_pressed = true;
+            break;
+        }
+    }
+    gpio_put(PIN_LED, any_pressed);
+
+    return true;
+}
+#endif
 
 // Palette support for both 640x480 and 800x600 modes
 static void set_game_palette(int index)
@@ -2523,7 +2587,7 @@ int main(void)
 
     while (true)
     {
-        nes_classic_controller();
+        game_controller();
         update_emulator_inputs();
         run_emulator_frame();
         frame_counter++;

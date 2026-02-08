@@ -1,9 +1,13 @@
 #pragma once
 
-#define USE_METRO_RP2350 0  // Set to 1 to use Adafruit Metro RP2350 board pinout, 0 for custom board
+#define USE_METRO_RP2350 1  // Set to 1 to use Adafruit Metro RP2350 board pinout, 0 for custom board
 
 #if USE_METRO_RP2350
 // Adafruit Metro RP2350 board
+
+// Set to 1 to enable NES Classic I2C-based controller support
+// Set to 0 to use old-school shift register controller support
+#define USE_NES_CLASSIC_CONTROLLER      1
 
 // SPI Pins, etc. -- for SD card
 #define SPI_INSTANCE_NUM            0
@@ -40,7 +44,10 @@
 
 #endif
 
-
+// Shift register pins -- for old-school NES controller
+#define PIN_NES_DATA                7
+#define PIN_NES_LATCH               6
+#define PIN_NES_PULSE               5
 
 // Default SD card SPI transfer rate after initialization (Hz)
 #define SD_SPI_BAUD_RATE (16 * 1000 * 1000)
