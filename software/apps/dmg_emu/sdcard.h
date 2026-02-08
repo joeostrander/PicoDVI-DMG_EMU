@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 
-#include "board_pins.h"
+#include "board_defs.h"
 #include "hardware/gpio.h"
 #include "sd_driver/SPI/my_spi.h"
 #include "sd_driver/sd_card.h"
@@ -15,9 +15,9 @@
 
 static spi_t system_spi = {
     .hw_inst = SPI_INSTANCE(SPI_INSTANCE_NUM),
-    .miso_gpio = SPI_MISO_PIN,
-    .mosi_gpio = SPI_MOSI_PIN,
-    .sck_gpio = SPI_SCK_PIN,
+    .miso_gpio = PIN_SPI_MISO,
+    .mosi_gpio = PIN_SPI_MOSI,
+    .sck_gpio = PIN_SPI_SCK,
     .baud_rate = SD_SPI_BAUD_RATE,
     .spi_mode = 0,
     .no_miso_gpio_pull_up = false,
@@ -31,7 +31,7 @@ static spi_t system_spi = {
 
 static sd_spi_if_t sd_spi_if = {
     .spi = &system_spi,
-    .ss_gpio = SPI_CS_PIN,
+    .ss_gpio = PIN_SPI_CS,
     .set_drive_strength = true,
     .ss_gpio_drive_strength = GPIO_DRIVE_STRENGTH_8MA,
     .state = {0},

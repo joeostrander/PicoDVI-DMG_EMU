@@ -2,6 +2,8 @@
 #define VIDEO_DEFS_H
 
 #include "dvi.h"
+#include "common_dvi_pin_configs.h"
+#include "board_defs.h"
 
 // Game Boy capture geometry (2bpp packed)
 #define DMG_PIXELS_X                160
@@ -55,6 +57,19 @@ static const struct dvi_timing __not_in_flash_func(dvi_timing_800x600p_60hz_280K
 
 #define VREG_VSEL VREG_VOLTAGE_1_10  // 252 MHz is comfortable at lower voltage
 #define DVI_TIMING dvi_timing_640x480p_60hz
+#endif
+
+static const struct dvi_serialiser_cfg metro_rp2350_dvi_cfg = {
+	.pio = DVI_DEFAULT_PIO_INST,
+	.sm_tmds = {0, 1, 2},
+	.pins_tmds = {18, 16, 12},
+	.pins_clk = 14,
+	.invert_diffpairs = false
+};
+#if USE_METRO_RP2350
+#define DVI_SERIAL_CONFIG metro_rp2350_dvi_cfg
+#else
+#define DVI_SERIAL_CONFIG DVI_DEFAULT_SERIAL_CONFIG
 #endif
 
 #define SCANLINE_COUNT    (FRAME_HEIGHT / DVI_VERTICAL_REPEAT)

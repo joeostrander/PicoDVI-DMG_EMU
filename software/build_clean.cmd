@@ -5,6 +5,10 @@ SET PLATFORM=rp2350
 SET BOARD=pico2
 SET RESOLUTION_MODE=2
 
+REM 0 = 640x480, horizontally scaled x4, vertically x3 --> 640x480 Full screen
+REM 1 = 800x600, horizontally scaled x4, vertically x4 --> 640x576 window
+REM 2 = 640x480, horizontally scaled x2, vertically x2 --> 320x288 window
+
 cd %~dp0
 rmdir /s /q build 2>nul
 mkdir build
@@ -45,6 +49,8 @@ if exist %DRIVE_LETTER%\ (
 ) else (
     echo %DRIVE_LETTER%\ drive not found, skipping copy
 )
+
+copy apps\dmg_emu\dmg_emu.uf2 ..\dmg_emu_%PLATFORM%_res%RESOLUTION_MODE%.uf2
 
 echo.
 echo ===== ALL DONE =====

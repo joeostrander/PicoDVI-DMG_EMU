@@ -1,12 +1,23 @@
 # PicoDVI-DMG_EMU
 
-Original PicoDVI DMG capture project:
+Play Gameboy DMG games with audio over HDMI with a Raspbery Pi Pico 2 (rp2350).  
+
+**Updates**:  
+- 2026.02.08 
+  - added support for the Adafruit Metro RP2350 + HSTX to DVI Adapter.  (set USE_METRO_RP2350 = 1 in board_defs.h)
+
+
+
+Original (non-emulated) PicoDVI DMG capture project:
 https://github.com/joeostrander/PicoDVI-DMG
 
-This version removes the need for an actual Game Boy DMG and uses emulation on the RP2350 with full HDMI video (via libdvi) and MiniGB APU audio. The original PicoDVI DMG capture pipeline has been replaced with an embedded Peanut-GB core, so the RP2350 now runs the entire emulator, renders frames directly into the TMDS encoder, and streams stereo audio over HDMI.
 
 ![gameplay preview](./images/gameplay.gif?raw=true)
 
+Using Adafruit Metro RP2350:  
+![pcb](./images/metro_rp2350.jpg?raw=true)
+
+Using my custom PCB: 
 ![pcb](./images/pcb_v1.png?raw=true)
 
 ![osd](./images/osd.jpg?raw=true) 
@@ -64,6 +75,7 @@ cd build
 cmake -G "MinGW Makefiles" -DPICO_COPY_TO_RAM=1 -DPICO_PLATFORM=rp2350 -DPICO_BOARD=pico2 ..
 cmake --build . -j4
 ```
+or see build_clean.cmd for what I use
 
 On Windows you can substitute `-G "MinGW Makefiles"` or use the VS Code CMake extension. The resulting UF2 lives under `software/apps/dmg_emu/` inside the build tree (follow the CMake output for the exact path).
 
@@ -75,10 +87,8 @@ On Windows you can substitute `-G "MinGW Makefiles"` or use the VS Code CMake ex
 ## Controls / Shortcuts
 
 - **NES Classic controller** maps to the standard Game Boy buttons.
-- **SELECT + LEFT/RIGHT** cycles palette schemes.
-- **SELECT + START** exit game (restart Pico)
-- **SELECT + HOME** exit game (restart Pico)
-- **SELECT + DOWN** save settings
+- **Home** launch OSD
+- **SELECT + START** launch OSD
 
 ## Credits
 

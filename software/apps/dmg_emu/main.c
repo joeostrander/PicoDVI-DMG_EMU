@@ -49,7 +49,7 @@
 
 #include "colors.h"
 #include "hedley.h"
-#include "board_pins.h"
+#include "board_defs.h"
 #include "sdcard.h"
 #include "ff.h"
 #include "f_util.h"
@@ -115,13 +115,8 @@ static uint64_t audio_sample_residual = 0;
 
 // #define DEBUG_BUTTON_PRESS
 
-#define ONBOARD_LED_PIN             25
 
-// I2C Pins, etc. -- for I2C controller
-#define SDA_PIN                     26
-#define SCL_PIN                     27
-#define I2C_ADDRESS                 0x52
-i2c_inst_t* i2cHandle = i2c1;
+i2c_inst_t* i2cHandle = MY_I2C_INSTANCE;
 
 //********************************************************************************
 // TYPEDEFS AND STRUCTS
@@ -1862,18 +1857,18 @@ static void run_emulator_frame(void)
 static void initialize_gpio(void)
 {    
     //Onboard LED
-    gpio_init(ONBOARD_LED_PIN);
-    gpio_set_dir(ONBOARD_LED_PIN, GPIO_OUT);
-    gpio_put(ONBOARD_LED_PIN, 0);
+    gpio_init(PIN_LED);
+    gpio_set_dir(PIN_LED, GPIO_OUT);
+    gpio_put(PIN_LED, 0);
 
     //Initialize I2C port at 400 kHz
     i2c_init(i2cHandle, 400 * 1000);
 
     // Initialize I2C pins
-    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(SCL_PIN);
-    gpio_pull_up(SDA_PIN);
+    gpio_set_function(PIN_SCL, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_SDA, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_SCL);
+    gpio_pull_up(PIN_SDA);
 }
 
 // static bool nes_classic_controller(void)
@@ -2020,7 +2015,7 @@ static bool __no_inline_not_in_flash_func(nes_classic_controller)(void)
             break;
         }
     }
-    gpio_put(ONBOARD_LED_PIN, any_pressed);
+    gpio_put(PIN_LED, any_pressed);
 
 
     if (!controller_armed)
@@ -2430,7 +2425,7 @@ int main(void)
     OSD_set_enabled(false);
 
     dvi0.timing = &DVI_TIMING;
-    dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+    dvi0.ser_cfg = DVI_SERIAL_CONFIG;
     dvi0.scanline_callback = core1_scanline_callback;
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
     boot_checkpoint("DVI configured");
@@ -2463,10 +2458,6 @@ int main(void)
     dvi_get_blank_settings(&dvi0)->bottom = 0;
     dvi_audio_sample_buffer_set(&dvi0, audio_buffer, AUDIO_BUFFER_SIZE);
     dvi_set_audio_freq(&dvi0, rate, cts, hdmi_n[offset]);
-    // Prime audio ring fully with silence before starting DVI to avoid initial underflow.
-    set_read_offset(&dvi0.audio_ring, 0);
-    set_write_offset(&dvi0.audio_ring, 0);
-    increase_write_pointer(&dvi0.audio_ring, AUDIO_BUFFER_SIZE);
     reset_audio_ring_prefill(AUDIO_BUFFER_SIZE - 8);
     for (int i = 0; i < 16; ++i) {
         pump_audio_samples();
