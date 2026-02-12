@@ -25,7 +25,7 @@ Using Adafruit Metro RP2350 (wired option):
 
 
 
-Using my custom PCB: 
+Another option:  Using my custom PCB (not designed for NESPi):  
 ![pcb](./images/pcb_v1.png?raw=true)
 
 ![osd](./images/osd.jpg?raw=true) 
