@@ -3,6 +3,8 @@
 Play Gameboy DMG games with audio over HDMI with a Raspbery Pi Pico 2 (rp2350).  
 
 **Updates**:  
+- 2026.02.14 
+  - Modified 3D parts & instructions (easier external controller jack mounting)
 - 2026.02.11 
   - Added instructions, 3D files, images, etc. for using a NESPi case  
 	[**Click here for NESPi case instructions**](./NESPi_Metro2350.md)

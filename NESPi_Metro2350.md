@@ -39,7 +39,7 @@ First, decide if you want to use a wireless receiver inside the case or mount an
 **Option 1**:  Internal wireless  
 Doing this allows you to do the whole thing with zero case mods.  You'll leave the USB ports installed, just to block the holes.  This option is much easier.  
 **Option 2**:  External jack  
-This option requires a slight case mod and 3D printed parts.  You'll remove the USB ports and cut the vertical separator on the case where the ports were.  It can take some work to get the part to fit just right.
+This option requires a slight case mod and 3D printed parts.  You'll remove the USB ports and cut the vertical separator on the case where the ports were.
 
 
 **Instructions**:  
@@ -96,4 +96,12 @@ Assemble the case and test it out!
 ![Wii Jack](./images/instructions/wii_jack.jpg?raw=true)  
 
 **Wii/Classic NES Jack Mount:**  
+Note:  you might not even need screws on this mount  
+(mechanical retention + friction fit + VHB tape)  
 ![Wii Jack Mount](./images/instructions/wii_jack_mount.jpg?raw=true)  
+
+![Wii Jack Mount VHB](./images/instructions/wii_mount_vhb.jpg?raw=true)  
+
+![Wii Jack Mount inst1](./images/instructions/wii_mount_inst1.jpg?raw=true)  
+
+![Wii Jack Mount inst2](./images/instructions/wii_mount_inst2.jpg?raw=true)  
