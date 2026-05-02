@@ -22,6 +22,47 @@ target_compile_options(dmg_emu PRIVATE -Wall)
 set(RESOLUTION_MODE "0" CACHE STRING "Resolution mode: 0=640x480 x4/x3, 1=800x600 x4/x4, 2=640x480 x2/x2")
 set_property(CACHE RESOLUTION_MODE PROPERTY STRINGS 0 1 2)
 
+# Optional Bluetooth controller support (Pico W / Pico 2 W).
+# Default to 1 to match board_defs.h and avoid accidental disable via stale cache.
+set(USE_BLUETOOTH_CONTROLLER "1" CACHE STRING "Controller mode: 0=NES controller, 1=Bluetooth HID host")
+set_property(CACHE USE_BLUETOOTH_CONTROLLER PROPERTY STRINGS 0 1)
+message(STATUS "dmg_emu: USE_BLUETOOTH_CONTROLLER=${USE_BLUETOOTH_CONTROLLER}")
+
+# Optional NES Classic / Wii I2C controller support.
+# 0 = shift-register NES controller, 1 = NES Classic / Wii I2C controller.
+set(USE_NES_CLASSIC_CONTROLLER "0" CACHE STRING "Controller mode: 0=shift-register NES, 1=NES Classic/Wii I2C")
+set_property(CACHE USE_NES_CLASSIC_CONTROLLER PROPERTY STRINGS 0 1)
+message(STATUS "dmg_emu: USE_NES_CLASSIC_CONTROLLER=${USE_NES_CLASSIC_CONTROLLER}")
+
+set(BT_TEST_HOST_FILES_ROOT "C:/DEV/PicoBluetoothGamepadTest/src/host_files" CACHE PATH
+    "Path to PicoBluetoothGamepadTest host_files folder")
+
+if(USE_BLUETOOTH_CONTROLLER STREQUAL "1")
+    set(BT_BLUEHOST_DIR "${BT_TEST_HOST_FILES_ROOT}/bluehost-lib")
+    set(BT_PARSER_DIR "${BT_TEST_HOST_FILES_ROOT}/parser-lib")
+
+    if(NOT EXISTS "${BT_BLUEHOST_DIR}/blue_host.c")
+        message(FATAL_ERROR "Bluetooth host source not found: ${BT_BLUEHOST_DIR}/blue_host.c")
+    endif()
+
+    if(NOT EXISTS "${BT_PARSER_DIR}/gamepad_parser.c")
+        message(FATAL_ERROR "Bluetooth parser source not found: ${BT_PARSER_DIR}/gamepad_parser.c")
+    endif()
+
+    target_sources(dmg_emu PRIVATE
+        ${BT_BLUEHOST_DIR}/blue_host.c
+        ${BT_PARSER_DIR}/gamepad_parser.c
+        ${BT_PARSER_DIR}/hidparser.c
+    )
+
+    target_include_directories(dmg_emu PRIVATE
+        ${BT_BLUEHOST_DIR}
+        ${BT_PARSER_DIR}
+        ${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_arch/include
+        ${PICO_SDK_PATH}/src/rp2_common/pico_btstack/include
+    )
+endif()
+
 if(RESOLUTION_MODE STREQUAL "1")
     set(DVI_VERTICAL_REPEAT_VALUE 4)
 elseif(RESOLUTION_MODE STREQUAL "2")
@@ -35,6 +76,8 @@ target_compile_definitions(dmg_emu PRIVATE
     DVI_VERTICAL_REPEAT=${DVI_VERTICAL_REPEAT_VALUE}
     DVI_SYMBOLS_PER_WORD=2
     RESOLUTION_MODE=${RESOLUTION_MODE}
+    USE_BLUETOOTH_CONTROLLER=${USE_BLUETOOTH_CONTROLLER}
+    USE_NES_CLASSIC_CONTROLLER=${USE_NES_CLASSIC_CONTROLLER}
     PICO_USE_MALLOC_PANIC=0
     PICO_FLASH_SIZE_BYTES=0x200000  # (2097152, 2MB) - I need to define this or it may set to 4MB by default
 )
@@ -54,6 +97,14 @@ target_link_libraries(dmg_emu
     hardware_flash
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
 )
+
+if(USE_BLUETOOTH_CONTROLLER STREQUAL "1")
+    target_link_libraries(dmg_emu
+        pico_btstack_classic
+        pico_btstack_cyw43
+        pico_cyw43_arch_none
+    )
+endif()
 
 if(TARGET hardware_rtc)
     target_link_libraries(dmg_emu hardware_rtc)

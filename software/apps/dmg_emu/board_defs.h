@@ -1,13 +1,21 @@
 #pragma once
 
-#define USE_METRO_RP2350 1  // Set to 1 to use Adafruit Metro RP2350 board pinout, 0 for custom board
+// Controller mode selection.
+// Exactly one transport should be enabled at a time.
+#ifndef USE_BLUETOOTH_CONTROLLER
+#define USE_BLUETOOTH_CONTROLLER       1
+#endif
+
+#define USE_METRO_RP2350 0  // Set to 1 to use Adafruit Metro RP2350 board pinout, 0 for custom board
 
 #if USE_METRO_RP2350
 // Adafruit Metro RP2350 board
 
 // Set to 1 to enable NES Classic I2C-based controller support
 // Set to 0 to use old-school shift register controller support
+#ifndef USE_NES_CLASSIC_CONTROLLER
 #define USE_NES_CLASSIC_CONTROLLER      1
+#endif
 
 // SPI Pins, etc. -- for SD card
 #define SPI_INSTANCE_NUM            0
@@ -27,6 +35,12 @@
 #else
 // Rev 1 of custom board (I may switch pinout to match Metro RP2350 later)
 
+// Set to 1 to enable NES Classic I2C-based controller support
+// Set to 0 to use old-school shift register controller support
+#ifndef USE_NES_CLASSIC_CONTROLLER
+#define USE_NES_CLASSIC_CONTROLLER      0
+#endif
+
 // SPI Pins, etc. -- for SD card
 #define SPI_INSTANCE_NUM            1
 #define PIN_SPI_MISO                8
@@ -37,6 +51,8 @@
 // I2C Pins, etc. -- for I2C controller
 #define PIN_SDA                     26
 #define PIN_SCL                     27
+//NEW??? #define PIN_SDA                     2
+//NEW??? #define PIN_SCL                     3
 #define MY_I2C_INSTANCE             i2c1
 
 // LED pin for debugging
@@ -54,4 +70,8 @@
 
 // I2C address for NES Classic controller
 #define I2C_ADDRESS                 0x52
+
+#if USE_BLUETOOTH_CONTROLLER && USE_NES_CLASSIC_CONTROLLER
+#error "USE_BLUETOOTH_CONTROLLER and USE_NES_CLASSIC_CONTROLLER cannot both be enabled"
+#endif
 
