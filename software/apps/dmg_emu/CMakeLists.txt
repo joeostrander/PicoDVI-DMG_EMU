@@ -34,8 +34,7 @@ set(USE_NES_CLASSIC_CONTROLLER "0" CACHE STRING "Controller mode: 0=shift-regist
 set_property(CACHE USE_NES_CLASSIC_CONTROLLER PROPERTY STRINGS 0 1)
 message(STATUS "dmg_emu: USE_NES_CLASSIC_CONTROLLER=${USE_NES_CLASSIC_CONTROLLER}")
 
-set(BT_TEST_HOST_FILES_ROOT "C:/DEV/PicoBluetoothGamepadTest/src/host_files" CACHE PATH
-    "Path to PicoBluetoothGamepadTest host_files folder")
+set(BT_TEST_HOST_FILES_ROOT "${CMAKE_SOURCE_DIR}/ext/host_files")
 
 if(USE_BLUETOOTH_CONTROLLER STREQUAL "1")
     set(BT_BLUEHOST_DIR "${BT_TEST_HOST_FILES_ROOT}/bluehost-lib")
